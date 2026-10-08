@@ -431,6 +431,50 @@ def invariant_ldap_bad_json_clean_error(cx):
     assert "Traceback" not in out and "AttributeError" not in out, "bad ldap json must be a clean error"
 
 
+def invariant_fail_no_lockout(cx):
+    # a FAILED guess must NOT become an owned credential or re-appear in the
+    # spray exports (account-lockout hazard), but the invalid access is recorded.
+    cx.run("fail", "CORP\\lockme", "--pass", "BadGuess9", "--at", "HOSTX", "--proto", "smb")
+    lid = cx.q1("SELECT id FROM identities WHERE username='lockme'")
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets WHERE identity_id=?", (lid,)) == 0, \
+        "fail must not create an ownership link"
+    assert "lockme:BadGuess9" not in cx.run("export", "pairs", "--type", "plaintext"), \
+        "a failed guess must not be re-emitted into export pairs"
+    assert "BadGuess9" not in cx.run("export", "passwords"), \
+        "a failed guess must not pollute the spray wordlist"
+    # the attempt is still recorded as an invalid access (so you know you tried it)
+    assert cx.q1("SELECT status FROM accesses WHERE identity_id=?", (lid,)) == "invalid"
+
+
+def invariant_export_passwords_clean(cx):
+    # the default spray wordlist excludes tester-planted (introduced) passwords
+    # and key passphrases, but includes owned + cracked found passwords; --all dumps all.
+    cx.run("cred", "CORP\\realuser", "--pass", "FoundInShare1")      # owned/discovered
+    cx.run("reset", "CORP\\planted", "--pass", "PlantedPw2")          # introduced
+    keyf = os.path.join(cx.workdir, "k_ep")
+    with open(keyf, "w") as fh:
+        fh.write("KEY")
+    cx.run("cred", "svc@10.0.0.200", "--key", keyf)
+    kid = cx.q1("SELECT id FROM secrets WHERE type='ssh_private_key'")
+    cx.run("unlock", "--key", "#%d" % kid, "--passphrase", "PassphraseZZ")
+    out = cx.run("export", "passwords")
+    assert "FoundInShare1" in out, "owned discovered password should be in the wordlist"
+    assert "PlantedPw2" not in out, "tester-planted password should be excluded by default"
+    assert "PassphraseZZ" not in out, "key passphrase should be excluded by default"
+    assert "PlantedPw2" in cx.run("export", "passwords", "--all"), "--all dumps every plaintext"
+
+
+def invariant_passwd_extra_colon(cx):
+    # a malformed passwd line (colon in GECOS) must still read the shell correctly
+    pw = os.path.join(cx.workdir, "pw_badcolon.txt")
+    with open(pw, "w") as fh:
+        fh.write("colonuser:x:1500:1500:Last:First:/home/colonuser:/bin/bash\n")
+    cx.run("import", "passwd", "--host", "10.0.0.201", pw)
+    hid = cx.q1("SELECT id FROM hosts WHERE name='10.0.0.201'")
+    sh = cx.q1("SELECT shell FROM identities WHERE username='colonuser' AND realm_id=?", (hid,))
+    assert sh == "/bin/bash", "shell must be read from the last field, got %r" % sh
+
+
 def invariant_superseded_reconcile(cx):
     # one identity owns two hashes that crack to the same plaintext; supersede the
     # first, crack it, then crack the still-live one -> the plaintext link stays live.
@@ -474,6 +518,9 @@ def main():
         ("INV null multi-target makes no phantom host", invariant_null_multitarget_no_phantom_host),
         ("INV nxc service uses real port + Pwn3d admin", invariant_nxc_service_port_and_pwned),
         ("INV ldap bad json is a clean error", invariant_ldap_bad_json_clean_error),
+        ("INV fail does not create lockout-risk spray entries", invariant_fail_no_lockout),
+        ("INV export passwords excludes planted/passphrase", invariant_export_passwords_clean),
+        ("INV passwd tolerates a colon in GECOS", invariant_passwd_extra_colon),
         ("INV superseded reconciles when a live hash yields it", invariant_superseded_reconcile),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))

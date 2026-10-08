@@ -58,7 +58,10 @@ and *echo the atomic steps they ran* so you learn the model):
 cm cred  'CORP\jsmith' --nt 00112233...  --src responder-mitm@10.0.0.50
 cm works 'CORP\jsmith' --at HOST1,HOST2,HOST3 --proto smb           # status=valid
 cm works 'CORP\jsmith' --at HOST4 --proto smb --priv local_admin
-cm fail  'CORP\jsmith' --at HOST9                                   # status=invalid
+cm fail  'CORP\jsmith' --at HOST9                                   # status=invalid (records the
+                                                                   #   failed attempt; does NOT mark the
+                                                                   #   cred as owned, so bad guesses never
+                                                                   #   re-enter your spray lists)
 cm cracked --from hashcat.potfile                                  # bulk, idempotent
 cm reset 'CORP\victim' --pass Pentest123!                          # you changed their pw
 ```
@@ -100,7 +103,9 @@ cm stats                                            # engagement summary
 
 ```bash
 cm export users     > users.txt            # deduped
-cm export passwords > passwords.txt        # deduped wordlist of found plaintexts
+cm export passwords > passwords.txt        # deduped wordlist: found/cracked passwords
+                                           #   (excludes your planted creds, key
+                                           #   passphrases, failed guesses; --all = every plaintext)
 cm export pairs --type plaintext           # user:password
 cm export pairs --type ntlm                # user:nthash  (pass-the-hash spray)
 cm export pairs --type plaintext --introduced   # only creds YOU planted (cleanup/report)

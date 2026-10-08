@@ -859,7 +859,12 @@ def _works_fail(store, args, status):
     username, rtype, rid = resolve_identity(store, args)
     iid, _ = store.upsert_identity(username, rtype, rid)
     sid = pick_secret_for_identity(store, args, iid, status)
-    store.link_identity_secret(iid, sid)
+    # A successful login means the identity OWNS this secret -> link it. A FAILED
+    # attempt does not: linking a bad guess would push it into export pairs and
+    # risk re-spraying a known-wrong password (account lockout). So for fail we
+    # record only the invalid access, and we don't fabricate ownership.
+    if status == "valid":
+        store.link_identity_secret(iid, sid)
     for tgt in targets:
         args.at = tgt
         scope, hid, svid = resolve_target(store, args)
@@ -1161,7 +1166,10 @@ def cmd_import_passwd(store, args):
         parts = line.split(":")
         if len(parts) < 7:
             continue
-        name, _pw, uid, _gid, gecos, _home, shell = parts[:7]
+        # anchor name/uid from the left and shell from the RIGHT, so a stray
+        # colon in the GECOS field can't push the shell out of position (only
+        # the cosmetic gecos field is affected on a malformed line).
+        name, uid, gecos, shell = parts[0], parts[2], parts[4], parts[-1]
         if shell.strip() in NOLOGIN_SHELLS:
             skipped += 1
             skipped_names.append(name)
@@ -1570,8 +1578,20 @@ def cmd_export(store, args):
         out = sorted(set(r["username"] for r in rows if r["username"] != ""))
         print("\n".join(out))
     elif what == "passwords":
-        rows = store.conn.execute(
-            "SELECT DISTINCT value FROM secrets WHERE type='plaintext'").fetchall()
+        if getattr(args, "all", False):
+            rows = store.conn.execute(
+                "SELECT DISTINCT value FROM secrets WHERE type='plaintext'").fetchall()
+        else:
+            # a spray wordlist of passwords actually found in the environment:
+            # owned by some identity (not tester-introduced), or the cracked
+            # result of a hash. Excludes planted passwords, failed-guess orphans
+            # and key passphrases. Use --all to dump every plaintext.
+            rows = store.conn.execute(
+                "SELECT DISTINCT s.value FROM secrets s WHERE s.type='plaintext' AND ("
+                "  EXISTS (SELECT 1 FROM identity_secrets il WHERE il.secret_id=s.id "
+                "          AND il.origin='discovered') "
+                "  OR EXISTS (SELECT 1 FROM secret_links sl WHERE sl.from_secret_id=s.id "
+                "             AND sl.relation='cracks'))").fetchall()
         print("\n".join(sorted(set(r["value"] for r in rows))))
     elif what == "pairs":
         stype = getattr(args, "type", None) or "plaintext"
@@ -1829,7 +1849,8 @@ def build_parser():
     sp.add_argument("--type", help="secret type (for pairs/hashes)")
     sp.add_argument("--domain"); sp.add_argument("--host")
     sp.add_argument("--introduced", action="store_true", help="only tester-introduced creds (pairs)")
-    sp.add_argument("--all", action="store_true", help="include superseded links (pairs)")
+    sp.add_argument("--all", action="store_true",
+                    help="pairs: include superseded links; passwords: dump every plaintext")
     sp.set_defaults(func=cmd_export)
 
     return p
