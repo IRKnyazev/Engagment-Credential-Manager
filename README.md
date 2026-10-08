@@ -90,6 +90,7 @@ cm show user 'CORP\jsmith'                          # everything about one ident
 cm show secret '#7'
 cm where --user 'CORP\jsmith'                       # where a cred works
 cm where --host HOST4                               # who works on a box
+cm where                                            # every access (add --valid to filter)
 cm hashes --type kerberos_tgs                       # list hashes of a type
 cm todo-crack                                       # crackable, not yet cracked, still live
 cm stats                                            # engagement summary
@@ -118,9 +119,11 @@ cm import nxc            nxc_smb.out                    # Pwn3d! -> local_admin
 ```
 
 `cm cracked --from hashcat.potfile` matches `hash:plaintext` lines against stored
-hashes by exact value (robust to colons in the hash), is idempotent on re-run,
-and **echoes in full any cracked hash it can't find in the db** — a nudge that
-you forgot to add one.
+hashes by value (robust to colons in the hash, and **case-insensitive** — an
+uppercase-stored NetNTLM/NTLM hash still matches hashcat's lowercase potfile
+line; the password's own case is preserved), is idempotent on re-run, and
+**echoes in full any cracked hash it can't find in the db** — a nudge that you
+forgot to add one.
 
 See `examples/` for the exact input formats each importer expects.
 

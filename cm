@@ -479,6 +479,15 @@ class Store:
             "VALUES(?,?,?,?)", (identity_id, secret_id, origin, superseded))
         extra = " origin=introduced" if origin == "introduced" else ""
         self.atom("+", "link %s <-> %s%s" % (ilabel, slabel, extra))
+        # If this secret was ALREADY cracked, back-link the plaintext too, so a
+        # hash owner discovered after the crack still shows its password in
+        # export pairs / show. (A plaintext is never the to-side of a 'cracks'
+        # link, so this recurses at most one level.)
+        for cr in self.conn.execute(
+                "SELECT from_secret_id FROM secret_links WHERE to_secret_id=? AND relation='cracks'",
+                (secret_id,)).fetchall():
+            self.link_identity_secret(identity_id, cr["from_secret_id"],
+                                      origin=origin, superseded=superseded)
         return cur.lastrowid, True
 
     def link_secrets(self, from_id, to_id, relation):
@@ -641,6 +650,19 @@ def read_blob_file(path):
     return base64.b64encode(data).decode("ascii"), os.path.basename(path)
 
 
+# pure-hex hash types whose canonical form is lowercase (safe to normalise).
+# NOT the unix-crypt types (bcrypt/sha*crypt salts are case-sensitive) nor the
+# NetNTLM/Kerberos strings (they carry user/domain labels); potfile matching
+# already compares those case-insensitively.
+HEX_NORMALIZE_TYPES = {"ntlm", "lm"}
+
+
+def normalize_hash(stype, value):
+    if stype in HEX_NORMALIZE_TYPES:
+        return value.strip().lower()
+    return value
+
+
 def secret_from_args(args):
     """Build (type, value, label, filename, expires) from secret flags, or None."""
     given = [bool(getattr(args, "password", None) is not None),
@@ -658,14 +680,16 @@ def secret_from_args(args):
     if getattr(args, "password", None) is not None:
         return ("plaintext", args.password, label, None, None)
     if getattr(args, "nt", None):
-        return ("ntlm", args.nt.strip(), label, None, None)
+        # pure-hex hashes have a canonical lowercase form (matches tool output and
+        # hashcat potfiles, so dedup and crack round-trips work)
+        return ("ntlm", normalize_hash("ntlm", args.nt.strip()), label, None, None)
     if getattr(args, "hash", None):
         htype, sep, hval = args.hash.partition(":")
         if not sep:
             raise CmError("--hash must be TYPE:VALUE, e.g. kerberos_tgs:'$krb5tgs$...'")
         if htype not in SECRET_TYPES:
             raise CmError("unknown hash type %r (valid: %s)" % (htype, ", ".join(sorted(CRACKABLE_TYPES))))
-        return (htype, hval, label, None, None)
+        return (htype, normalize_hash(htype, hval), label, None, None)
     if getattr(args, "key", None):
         b64, fn = read_blob_file(args.key)
         return ("ssh_private_key", b64, label, fn, None)
@@ -760,7 +784,10 @@ def resolve_target(store, args, allow_missing=False):
         raise CmError("service access needs a port: use --at %s:PORT" % host)
     if raw_port is None:
         assumed.append("port %d for %s" % (port, proto))
-    sid, _ = store.upsert_service(hid, port, proto if proto else "")
+    # key the service row by host:port only (service name left ""), so a service
+    # identity's realm and its access land on the SAME services row; the protocol
+    # is recorded on the access, not duplicated into the service name.
+    sid, _ = store.upsert_service(hid, port, "")
     if assumed:
         store.note("[assumed: %s]" % "; ".join(assumed))
     return ("service", None, sid)
@@ -821,13 +848,18 @@ def cmd_cred(store, args):
 
 
 def _works_fail(store, args, status):
+    # split the (possibly comma-separated) target list first, and guard an
+    # omitted --at cleanly (None.split would otherwise traceback). Use the first
+    # target for realm inference so a --null session anchors to a real host, not
+    # the comma-joined string.
+    targets = [t.strip() for t in (args.at or "").split(",") if t.strip()]
+    if not targets:
+        raise CmError("--at HOST[:PORT] is required")
+    args.at = targets[0]
     username, rtype, rid = resolve_identity(store, args)
     iid, _ = store.upsert_identity(username, rtype, rid)
     sid = pick_secret_for_identity(store, args, iid, status)
     store.link_identity_secret(iid, sid)
-    targets = [t.strip() for t in args.at.split(",") if t.strip()]
-    if not targets:
-        raise CmError("--at HOST[:PORT] is required")
     for tgt in targets:
         args.at = tgt
         scope, hid, svid = resolve_target(store, args)
@@ -931,6 +963,12 @@ def _apply_crack(store, hashrow, plaintext):
             tag = " (superseded)" if o["superseded"] else ""
             store.atom("+", "link %s <-> secret #%d plaintext%s" % (
                 store._ident_label_by_id(o["identity_id"]), pt_id, tag))
+        elif existing["superseded"] and not o["superseded"]:
+            # another, still-live hash owned by this identity yields the same
+            # plaintext - keep the derived plaintext link live (don't let a
+            # first-cracked superseded hash pin it stale)
+            store.conn.execute(
+                "UPDATE identity_secrets SET superseded=0 WHERE id=?", (existing["id"],))
     return pt_id
 
 
@@ -951,6 +989,12 @@ def _cracked_bulk(store, args):
         "SELECT * FROM secrets WHERE type!='plaintext' AND type NOT IN "
         "('ssh_private_key','certificate_pfx','kerberos_ticket') "
         "ORDER BY length(value) DESC").fetchall()
+    # pre-lower the hash prefixes once: hashcat potfiles are lowercase hex and the
+    # user/domain label in NetNTLM strings varies in case, while the stored value
+    # may be uppercase. The hash portion is case-insensitive; the PASSWORD (after
+    # the hash) is not, so we only fold case on the prefix and slice the plaintext
+    # from the original line.
+    lowered = [(h, (h["value"] + ":").lower()) for h in hashes]
     new_links = 0
     already = 0
     skipped = []
@@ -961,8 +1005,9 @@ def _cracked_bulk(store, args):
             continue
         matched = None
         plaintext = None
-        for h in hashes:
-            if line.startswith(h["value"] + ":"):
+        low = line.lower()
+        for h, pfx in lowered:
+            if low.startswith(pfx):
                 matched = h
                 plaintext = line[len(h["value"]) + 1:]
                 break
@@ -1179,8 +1224,13 @@ def cmd_import_ldap(store, args):
             data = json.load(fh)
     except (OSError, ValueError) as e:
         raise CmError("cannot parse %s as JSON: %s" % (args.file, e))
+    if isinstance(data, list):
+        entries = data
+    elif isinstance(data, dict):
+        entries = data.get("entries", data.get("users", []))
+    else:
+        raise CmError("cannot parse %s: expected a JSON list or object of LDAP entries" % args.file)
     did, _ = store.upsert_domain(args.domain)
-    entries = data if isinstance(data, list) else data.get("entries", data.get("users", []))
     count = 0
     store.echo_enabled = False
     for e in entries:
@@ -1275,10 +1325,10 @@ def cmd_import_nxc(store, args):
         else:
             rtype, rid = store.resolve_place(("host", ip))
         iid, _ = store.upsert_identity(user, rtype, rid)
-        # secret: 32-hex (optionally lm:nt) -> ntlm, else plaintext
+        # secret: 32-hex (optionally lm:nt) -> ntlm (lowercased, canonical), else plaintext
         sval = secret
         if ":" in secret and len(secret.split(":")[-1]) == 32:
-            sval = secret.split(":")[-1]
+            sval = secret.split(":")[-1].lower()
             stype = "ntlm"
         elif len(secret) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in secret):
             stype = "ntlm"
@@ -1289,10 +1339,12 @@ def cmd_import_nxc(store, args):
         store.link_identity_secret(iid, sid)
         hid, _ = store.upsert_host(ip)
         pdef = PROTO_DEFAULTS.get(proto, ("host", None))
-        if pdef[0] == "service" and pdef[1]:
-            svid, _ = store.upsert_service(hid, pdef[1], proto)
+        # nxc column 3 (toks[2]) is the real port - use it, not the proto default
+        real_port = int(toks[2]) if len(toks) > 2 and toks[2].isdigit() else pdef[1]
+        if pdef[0] == "service" and real_port:
+            svid, _ = store.upsert_service(hid, real_port, "")
             store.upsert_access(iid, sid, "service", None, svid, protocol=proto,
-                                privilege=("" ), status="valid")
+                                privilege=("admin" if pwned else ""), status="valid")
         else:
             store.upsert_access(iid, sid, "host", hid, None, protocol=proto,
                                 privilege=("local_admin" if pwned else "user"), status="valid")
@@ -1349,16 +1401,6 @@ def cmd_hashes(store, args):
         print(store.c.dim("(no hashes)"))
 
 
-def _uncracked_rows(store):
-    return store.conn.execute(
-        "SELECT s.* FROM secrets s WHERE s.type IN (%s) "
-        "AND NOT EXISTS (SELECT 1 FROM secret_links sl WHERE sl.to_secret_id=s.id AND sl.relation='cracks') "
-        "AND NOT EXISTS (SELECT 1 FROM identity_secrets il WHERE il.secret_id=s.id AND il.superseded=0 "
-        "                HAVING 0) "
-        "ORDER BY s.type, s.id" % ",".join("?" * len(CRACKABLE_TYPES)),
-        sorted(CRACKABLE_TYPES)).fetchall()
-
-
 def cmd_todo_crack(store, args):
     # crackable, not yet cracked, and still live (ownerless OR >=1 non-superseded link)
     rows = store.conn.execute(
@@ -1399,7 +1441,14 @@ def cmd_where(store, args):
         print(store.c.bold("accesses on %s:" % host))
         _print_accesses(store, rows, show_user=True)
     else:
-        raise CmError("use `cm where --user X` or `cm where --host Y`")
+        # engagement-wide listing (for lateral-movement planning / reporting)
+        q = "SELECT * FROM accesses"
+        if getattr(args, "valid", False):
+            q += " WHERE status='valid'"
+        q += " ORDER BY status, scope"
+        rows = store.conn.execute(q).fetchall()
+        print(store.c.bold("valid accesses:" if getattr(args, "valid", False) else "all accesses:"))
+        _print_accesses(store, rows, show_user=True)
 
 
 def _print_accesses(store, rows, show_user):
@@ -1554,7 +1603,11 @@ def cmd_export(store, args):
         row = store.resolve_secret_ref(args.ref)
         if row["type"] not in BLOB_TYPES:
             raise CmError("#%d is not a key/pfx/ticket blob" % row["id"])
-        sys.stdout.buffer.write(base64.b64decode(row["value"]))
+        try:
+            blob = base64.b64decode(row["value"], validate=True)
+        except Exception as e:  # binascii.Error (a ValueError) on a non-base64 value
+            raise CmError("secret #%d does not hold a valid base64 blob (%s)" % (row["id"], e))
+        sys.stdout.buffer.write(blob)
     else:
         raise CmError("export users|passwords|pairs|hashes|key")
 
@@ -1754,9 +1807,10 @@ def build_parser():
     sp = sub.add_parser("todo-crack", help="crackable hashes not yet cracked and still live")
     sp.set_defaults(func=cmd_todo_crack)
 
-    sp = sub.add_parser("where", help="where a cred works / who works on a host")
+    sp = sub.add_parser("where", help="where a cred works / who works on a host / all accesses")
     sp.add_argument("--user"); sp.add_argument("--null", action="store_true"); sp.add_argument("--realm")
     sp.add_argument("--host")
+    sp.add_argument("--valid", action="store_true", help="with no --user/--host: only valid accesses")
     sp.set_defaults(func=cmd_where)
 
     sp = sub.add_parser("show", help="show a user or secret in detail")
@@ -1810,6 +1864,15 @@ def main(argv=None):
         except Exception:
             pass
         return 0
+    except KeyboardInterrupt:
+        return 130
+    except (sqlite3.Error, OSError, ValueError, OverflowError, UnicodeError) as e:
+        # last-resort: a field tool should never spit a raw traceback. Turn any
+        # stray library error into a clean message (set CM_DEBUG=1 to re-raise).
+        if os.environ.get("CM_DEBUG"):
+            raise
+        print(color.red("error: ") + "%s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
     finally:
         try:
             store.conn.close()

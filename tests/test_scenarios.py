@@ -362,6 +362,89 @@ def invariant_potfile_idempotent(cx):
     assert links_after_first == links_after_second == 1, "potfile re-run must be idempotent"
 
 
+def invariant_potfile_case_insensitive(cx):
+    # real-world (reported) bug: a NetNTLMv2 stored with UPPER-case hex + a given
+    # username case must still match a hashcat potfile line that is lower-case hex
+    # with a different username case. The PASSWORD case must be preserved.
+    stored = ("paul::FILES01:0A79D604907FE974:4BECA034B4C57D5C14AFAA25919EDC63:"
+              "0101000000000000804B6179E256DD01")
+    cx.run("cred", "FILES01\\paul", "--hash", "netntlmv2:" + stored, "--realm", "host:FILES01")
+    pot = os.path.join(cx.workdir, "ntlmv2.pot")
+    potline = stored.upper().replace("PAUL::FILES01", "PAUL::FILES01").lower()  # lowercase all
+    # also flip the username to uppercase to mimic responder vs hashcat differences
+    potline = "PAUL" + potline[4:]
+    with open(pot, "w") as fh:
+        fh.write(potline + ":123Password123\n")
+    out = cx.run("cracked", "--from", pot)
+    assert "1 new" in out, "case-differing potfile line must match the stored hash:\n" + out
+    assert cx.q1("SELECT COUNT(*) FROM secrets WHERE type='plaintext' AND value='123Password123'") == 1
+    pid = cx.q1("SELECT id FROM identities WHERE username='paul'")
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets il JOIN secrets s ON s.id=il.secret_id "
+                 "WHERE il.identity_id=? AND s.value='123Password123'", (pid,)) == 1, \
+        "cracked plaintext must link to paul"
+
+
+def invariant_crack_backpropagates(cx):
+    # crack a hash FIRST, then discover another owner of that (deduped) hash later;
+    # the plaintext must back-link so export pairs / show include the new owner.
+    H = "aa11bb22cc33dd44ee55ff6677889900"
+    cx.run("cred", "CORP\\early", "--nt", H)
+    cx.run("cracked", "#%d" % cx.q1("SELECT id FROM secrets WHERE value=?", (H,)), "--pass", "ReusePW1")
+    cx.run("cred", "CORP\\late", "--nt", H)          # owner discovered AFTER the crack
+    out = cx.run("export", "pairs", "--type", "plaintext")
+    assert "late:ReusePW1" in out, "owner linked after the crack must appear in export pairs:\n" + out
+    assert "early:ReusePW1" in out
+
+
+def invariant_works_without_at_clean_error(cx):
+    cx.run("cred", "CORP\\noat", "--pass", "pw")
+    out = cx.run("works", "CORP\\noat", expect_fail=True)
+    assert "--at" in out, "missing --at must be a clean error, not a traceback"
+    assert "Traceback" not in out and "AttributeError" not in out
+
+
+def invariant_null_multitarget_no_phantom_host(cx):
+    cx.run("works", "--null", "--at", "DCA,DCB", "--proto", "smb")
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='DCA,DCB'") == 0, \
+        "multi-target null session must not create a comma-named phantom host"
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='DCA'") == 1
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='DCB'") == 1
+
+
+def invariant_nxc_service_port_and_pwned(cx):
+    path = os.path.join(cx.workdir, "nxc_mssql.txt")
+    with open(path, "w") as fh:
+        fh.write("MSSQL       10.0.0.80       14330  SQLBOX           [+] CORP.LOCAL\\sa:pw (Pwn3d!)\n")
+    cx.run("import", "nxc", path)
+    row = cx.qall("SELECT a.*, sv.port AS p FROM accesses a JOIN services sv ON sv.id=a.service_id "
+                  "JOIN hosts h ON h.id=sv.host_id WHERE h.name='10.0.0.80'")
+    assert len(row) == 1, "mssql service access expected"
+    assert row[0]["p"] == 14330, "must use the real nxc port column, not the proto default (got %s)" % row[0]["p"]
+    assert row[0]["privilege"] == "admin", "Pwn3d! on a service must record admin, not blank"
+
+
+def invariant_ldap_bad_json_clean_error(cx):
+    bad = os.path.join(cx.workdir, "bad.json")
+    with open(bad, "w") as fh:
+        fh.write("null")
+    out = cx.run("import", "ldapdomaindump", "--domain", "X.LOCAL", bad, expect_fail=True)
+    assert "Traceback" not in out and "AttributeError" not in out, "bad ldap json must be a clean error"
+
+
+def invariant_superseded_reconcile(cx):
+    # one identity owns two hashes that crack to the same plaintext; supersede the
+    # first, crack it, then crack the still-live one -> the plaintext link stays live.
+    H1 = "1111111111111111aaaaaaaaaaaaaaaa"
+    v2 = "zz::Z:1111:2222333344445555:ABCD"
+    cx.run("cred", "CORP\\zz", "--nt", H1)
+    cx.run("cred", "CORP\\zz", "--hash", "netntlmv2:" + v2)
+    cx.run("supersede", "CORP\\zz", "--secret", "#%d" % cx.q1("SELECT id FROM secrets WHERE value=?", (H1,)))
+    cx.run("cracked", "#%d" % cx.q1("SELECT id FROM secrets WHERE value=?", (H1,)), "--pass", "LiveReuse")
+    cx.run("cracked", "#%d" % cx.q1("SELECT id FROM secrets WHERE value=?", (v2,)), "--pass", "LiveReuse")
+    out = cx.run("export", "pairs", "--type", "plaintext")
+    assert "zz:LiveReuse" in out, "a live hash yielding the plaintext must keep the pair live:\n" + out
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -385,6 +468,13 @@ def main():
         ("S15 shared hash, one owner superseded", scenario_15_shared_supersede),
         ("S16 kerberos ticket + pfx (blob round-trip)", scenario_16_ticket_pfx),
         ("INV potfile import is idempotent + echoes misses", invariant_potfile_idempotent),
+        ("INV potfile matching is case-insensitive (reported bug)", invariant_potfile_case_insensitive),
+        ("INV crack back-propagates to owners found later", invariant_crack_backpropagates),
+        ("INV works without --at is a clean error", invariant_works_without_at_clean_error),
+        ("INV null multi-target makes no phantom host", invariant_null_multitarget_no_phantom_host),
+        ("INV nxc service uses real port + Pwn3d admin", invariant_nxc_service_port_and_pwned),
+        ("INV ldap bad json is a clean error", invariant_ldap_bad_json_clean_error),
+        ("INV superseded reconciles when a live hash yields it", invariant_superseded_reconcile),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:
