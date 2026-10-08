@@ -1610,6 +1610,90 @@ def _show_secret(store, row):
         print("  %s by #%d %s %s" % (l["relation"], l["sid"], l["st"], mask(l["sv"])))
 
 
+def cmd_ls(store, args):
+    """One-screen overview of the whole engagement: places, then every identity
+    with its secrets and where it works. The 'what's in here?' command."""
+    c = store.c
+    status_col = {"valid": c.green, "invalid": c.red, "untested": c.yellow,
+                  "expired": c.dim}
+
+    def place_filter_ok(ident):
+        if getattr(args, "domain", None):
+            d = store.conn.execute("SELECT id FROM domains WHERE fqdn=?", (args.domain,)).fetchone()
+            return ident["realm_type"] == "domain" and d and ident["realm_id"] == d["id"]
+        if getattr(args, "host", None):
+            h = store.conn.execute("SELECT id FROM hosts WHERE name=?", (args.host,)).fetchone()
+            if not h:
+                return False
+            if ident["realm_type"] == "host" and ident["realm_id"] == h["id"]:
+                return True
+            # also include service identities on that host
+            if ident["realm_type"] == "service":
+                s = store.conn.execute("SELECT host_id FROM services WHERE id=?", (ident["realm_id"],)).fetchone()
+                return s and s["host_id"] == h["id"]
+            return False
+        return True
+
+    print(c.bold("engagement: ") + store.path)
+    filtered = bool(getattr(args, "host", None) or getattr(args, "domain", None))
+    if not filtered:  # with a --host/--domain filter, skip the inventory and focus on identities
+        hrows = store.conn.execute("SELECT name, os FROM hosts ORDER BY name").fetchall()
+        drows = store.conn.execute("SELECT fqdn FROM domains ORDER BY fqdn").fetchall()
+        if hrows:
+            print(c.bold("\nhosts (%d):" % len(hrows)))
+            for h in hrows:
+                print("  %s%s" % (h["name"], (" (%s)" % h["os"]) if h["os"] else ""))
+        if drows:
+            print(c.bold("\ndomains (%d):" % len(drows)))
+            for d in drows:
+                print("  " + d["fqdn"])
+
+    idents = [i for i in store.conn.execute(
+        "SELECT * FROM identities ORDER BY realm_type, username").fetchall() if place_filter_ok(i)]
+    print(c.bold("\nidentities (%d):" % len(idents)))
+    if not idents:
+        print(c.dim("  (none)"))
+    for i in idents:
+        print("  " + c.bold(store.identity_label_row(i)) +
+              (("  " + c.dim(i["description"])) if i["description"] else ""))
+        secs = store.conn.execute(
+            "SELECT il.origin AS o, il.superseded AS sup, s.id AS sid, s.type AS st, s.value AS sv "
+            "FROM identity_secrets il JOIN secrets s ON s.id=il.secret_id "
+            "WHERE il.identity_id=? ORDER BY il.superseded, s.type", (i["id"],)).fetchall()
+        for s in secs:
+            val = "(blob)" if s["st"] in BLOB_TYPES else s["sv"]
+            tags = []
+            if s["o"] == "introduced":
+                tags.append("introduced")
+            if s["sup"]:
+                tags.append("superseded")
+            line = "      #%d %s %s" % (s["sid"], s["st"], val)
+            if tags:
+                line += c.dim("  [" + ", ".join(tags) + "]")
+            print(c.dim(line) if s["sup"] else line)
+        if not secs:
+            print(c.dim("      (no secret yet)"))
+        accs = store.conn.execute(
+            "SELECT * FROM accesses WHERE identity_id=? ORDER BY status, scope", (i["id"],)).fetchall()
+        for a in accs:
+            if getattr(args, "valid", False) and a["status"] != "valid":
+                continue
+            tgt = store._target_label(a["scope"], a["host_id"], a["service_id"])
+            proto = (a["protocol"] + "/") if a["protocol"] else ""
+            priv = ("  " + a["privilege"]) if a["privilege"] else ""
+            col = status_col.get(a["status"], c.dim)
+            print("      %s %s%s  %s%s" % (c.dim("->"), proto, tgt, col(a["status"]), priv))
+
+    todo = store.conn.execute(
+        "SELECT COUNT(*) FROM secrets s WHERE s.type IN (%s) "
+        "AND NOT EXISTS (SELECT 1 FROM secret_links sl WHERE sl.to_secret_id=s.id AND sl.relation='cracks') "
+        "AND ((SELECT COUNT(*) FROM identity_secrets il WHERE il.secret_id=s.id)=0 "
+        "     OR EXISTS (SELECT 1 FROM identity_secrets il WHERE il.secret_id=s.id AND il.superseded=0))"
+        % ",".join("?" * len(CRACKABLE_TYPES)), sorted(CRACKABLE_TYPES)).fetchone()[0]
+    if todo:
+        print(c.bold("\nto crack (%d): " % todo) + c.dim("run `cm todo-crack` for the list / `cm export hashes --type T`"))
+
+
 def cmd_stats(store, args):
     c = store.c
     def one(q, p=()):
@@ -1743,12 +1827,18 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="cm", description="credential manager for pentest/CTF engagements",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="examples:\n"
-               "  cm init corp.db\n"
+        epilog="see what's in the db:\n"
+               "  cm ls                     # overview: every identity, its secrets and where it works\n"
+               "  cm stats                  # just the counts\n"
+               "  cm show user 'CORP\\jsmith'  # one identity in full\n"
+               "  cm where --valid          # every confirmed login\n"
+               "  cm todo-crack             # hashes still to crack\n"
+               "\nrecord as you go:\n"
                "  cm cred 'CORP\\jsmith' --nt 00112233... --src responder-mitm@10.0.0.50\n"
                "  cm works 'CORP\\jsmith' --at HOST1,HOST2 --proto smb --priv user\n"
                "  cm cracked --from hashcat.potfile\n"
-               "  cm export pairs --type ntlm > userhash.txt\n")
+               "  cm export pairs --type ntlm > userhash.txt\n"
+               "\nlocal (standalone/workgroup) account -> use user@host, not COMPUTER\\user\n")
     p.add_argument("--db", help="engagement database (env CM_DB, default ./engagement.db)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress the teaching echo lines")
     p.add_argument("--version", action="version", version="cm " + VERSION)
@@ -1903,6 +1993,12 @@ def build_parser():
     sp.add_argument("name")
     add_identity_flags(sp)
     sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("ls", help="overview of the whole engagement (what's in the db)")
+    sp.add_argument("--host", help="only this host (and its services)")
+    sp.add_argument("--domain", help="only this domain")
+    sp.add_argument("--valid", action="store_true", help="show only valid accesses")
+    sp.set_defaults(func=cmd_ls)
 
     sp = sub.add_parser("stats", help="engagement summary counts")
     sp.set_defaults(func=cmd_stats)
