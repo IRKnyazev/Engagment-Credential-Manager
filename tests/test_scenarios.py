@@ -475,6 +475,26 @@ def invariant_passwd_extra_colon(cx):
     assert sh == "/bin/bash", "shell must be read from the last field, got %r" % sh
 
 
+def invariant_merge_local_domain_split(cx):
+    # the real MARKETINGWK01 scenario: a Responder capture filed under the
+    # computer name as a domain (DOMAIN\user), and nxc local logins filed under
+    # the host (user@host) are the same principal. merge reconciles them.
+    cx.run("cred", "WK01\\sam", "--hash", "netntlmv2:sam::WK01:aa11:bb22:cc33")  # domain realm
+    p = os.path.join(cx.workdir, "wk01.nxc")
+    with open(p, "w") as fh:
+        fh.write("SMB   10.0.0.90   445   WK01   [+] WK01\\sam:Pw (Pwn3d!)\n")
+    cx.run("import", "nxc", p)                                                   # host realm + access
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='sam'") == 2, "two sams expected pre-merge"
+    cx.run("merge", "WK01\\sam", "sam@10.0.0.90")
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='sam'") == 1, "merge should leave one sam"
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE realm_type='domain' AND username='sam'") == 0
+    host_sam = cx.q1("SELECT id FROM identities WHERE username='sam' AND realm_type='host'")
+    # host sam now carries BOTH the netntlmv2 secret and the nxc access
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets il JOIN secrets s ON s.id=il.secret_id "
+                 "WHERE il.identity_id=? AND s.type='netntlmv2'", (host_sam,)) == 1
+    assert cx.q1("SELECT COUNT(*) FROM accesses WHERE identity_id=?", (host_sam,)) == 1
+
+
 def invariant_superseded_reconcile(cx):
     # one identity owns two hashes that crack to the same plaintext; supersede the
     # first, crack it, then crack the still-live one -> the plaintext link stays live.
@@ -521,6 +541,7 @@ def main():
         ("INV fail does not create lockout-risk spray entries", invariant_fail_no_lockout),
         ("INV export passwords excludes planted/passphrase", invariant_export_passwords_clean),
         ("INV passwd tolerates a colon in GECOS", invariant_passwd_extra_colon),
+        ("INV merge reconciles a local/domain identity split", invariant_merge_local_domain_split),
         ("INV superseded reconciles when a live hash yields it", invariant_superseded_reconcile),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))

@@ -735,6 +735,33 @@ def resolve_identity(store, args, need_realm=True):
     return username, rtype, rid
 
 
+def resolve_existing_identity(store, token):
+    """Resolve a qualified identity token to an existing identity row WITHOUT
+    creating any places. Errors if the realm or identity does not exist. Used by
+    merge, where both sides must already be present."""
+    username, hint = parse_principal(token)
+    kind = hint[0]
+    if kind == "domain":
+        r = store.conn.execute("SELECT id FROM domains WHERE fqdn=?", (hint[1],)).fetchone()
+        place = ("domain", r["id"]) if r else None
+    elif kind == "host":
+        r = store.conn.execute("SELECT id FROM hosts WHERE name=?", (hint[1],)).fetchone()
+        place = ("host", r["id"]) if r else None
+    elif kind == "service":
+        r = store.conn.execute(
+            "SELECT s.id AS id FROM services s JOIN hosts h ON h.id=s.host_id "
+            "WHERE h.name=? AND s.port=?", (hint[1], hint[2])).fetchone()
+        place = ("service", r["id"]) if r else None
+    else:
+        raise CmError("merge needs qualified identities: DOMAIN\\user, user@host, or user@host:port")
+    if not place:
+        raise CmError("no such identity: %s" % token)
+    ident = store.find_identity(username, place[0], place[1])
+    if not ident:
+        raise CmError("no such identity: %s" % token)
+    return ident
+
+
 def decide_scope(at, proto, scope_opt):
     """Pure decision: (scope, host, port) from a target string + proto + override.
 
@@ -903,6 +930,37 @@ def cmd_reset(store, args):
     store.link_identity_secret(iid, sid, origin="introduced")
     if getattr(args, "src", None):
         store.add_observation(args.src, identity_id=iid, secret_id=sid)
+    store.commit()
+
+
+def cmd_merge(store, args):
+    """Fold the source identity into the destination (same real principal split
+    across two realms - e.g. a local account captured once as DOMAIN\\user and
+    once as user@host). Moves secrets, accesses and observations, then removes
+    the now-empty source identity."""
+    src = resolve_existing_identity(store, args.source)
+    dst = resolve_existing_identity(store, args.dest)
+    if src["id"] == dst["id"]:
+        raise CmError("source and destination are the same identity")
+    s, d = src["id"], dst["id"]
+    moved = {"secrets": 0, "accesses": 0, "observations": 0}
+    for table, key in (("identity_secrets", "secrets"),
+                       ("accesses", "accesses"),
+                       ("observations", "observations")):
+        for row in store.conn.execute(
+                "SELECT id FROM %s WHERE identity_id=?" % table, (s,)).fetchall():
+            try:
+                store.conn.execute(
+                    "UPDATE %s SET identity_id=? WHERE id=?" % table, (d, row["id"]))
+                moved[key] += 1
+            except sqlite3.IntegrityError:
+                # destination already has an equivalent row - drop the duplicate
+                store.conn.execute("DELETE FROM %s WHERE id=?" % table, (row["id"],))
+    srclabel = store.identity_label_row(src)
+    dstlabel = store.identity_label_row(dst)
+    store.conn.execute("DELETE FROM identities WHERE id=?", (s,))
+    store.atom("-", "merged %s into %s (%d secrets, %d accesses, %d observations)" %
+               (srclabel, dstlabel, moved["secrets"], moved["accesses"], moved["observations"]))
     store.commit()
 
 
@@ -1734,6 +1792,13 @@ def build_parser():
     add_secret_flags(sp)
     sp.add_argument("--src", help="provenance note")
     sp.set_defaults(func=cmd_reset)
+
+    # merge (reconcile two identities that are the same principal)
+    sp = sub.add_parser("merge", help="fold one identity into another (e.g. a local acct "
+                                      "filed once as DOMAIN\\user and once as user@host)")
+    sp.add_argument("source", help="identity to fold in (qualified: DOMAIN\\user | user@host | user@host:port)")
+    sp.add_argument("dest", help="identity to keep")
+    sp.set_defaults(func=cmd_merge)
 
     # supersede (atomic)
     sp = sub.add_parser("supersede", help="mark an identity's secret stale")

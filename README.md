@@ -70,7 +70,7 @@ cm reset 'CORP\victim' --pass Pentest123!                          # you changed
 
 ```bash
 cm add host|domain|service|user|secret ...
-cm link / cm access / cm supersede / cm observe / cm unlock
+cm link / cm access / cm supersede / cm observe / cm unlock / cm merge
 ```
 
 ## Referring to things
@@ -78,6 +78,11 @@ cm link / cm access / cm supersede / cm observe / cm unlock
 - **Identity:** `DOMAIN\user` (domain), `user@host` (host-local), `user@host:port`
   (a service), or `--null` for the SMB null session (empty username). `--realm
   domain:X | host:X | service:HOST:PORT` overrides.
+  - **Local accounts on a standalone/workstation box:** prefer `user@host` (e.g.
+    `sam@10.0.0.5`). A *computer name* used as a `\` prefix (`WK01\sam`) is read
+    as a **domain** — which splits it from the same account captured as local
+    (nxc `--local-auth`, a SAM dump). If that happens, reconcile with
+    `cm merge 'WK01\sam' sam@10.0.0.5` (folds the first into the second).
 - **Secret:** inline `--pass` / `--nt` / `--hash TYPE:VALUE` / `--key FILE` /
   `--pfx FILE` / `--ticket FILE`; or reference an existing one by `#id`,
   `type:value`, or a unique value-prefix.
