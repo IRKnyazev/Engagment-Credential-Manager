@@ -167,8 +167,28 @@ e.g. `[assumed: mssql -> service-auth (scope=service); port 1433 for mssql]`.
 cm import passwd         --host 10.0.0.5 passwd.txt     # login-shell users only
 cm import shadow         --host 10.0.0.5 shadow.txt     # attaches $6$/$y$/… hashes to them
 cm import ldapdomaindump --domain CORP.LOCAL domain_users.json
-cm import secretsdump    --domain CORP.LOCAL ntds.out   # NTDS; or --host NAME for a SAM dump
+cm import samdump        --host 10.0.0.5 relay.log      # SAM dump -> local accounts
+cm import samdump        --domain CORP.LOCAL ntds.out   # NTDS dump -> domain accounts
 cm import nxc            smb.nxc                        # NetExec console output; Pwn3d! -> admin
+```
+
+`samdump` is the `name:rid:lmhash:nthash:::` (pwdump) format — from
+impacket-secretsdump, `nxc --sam/--ntds`, or an ntlmrelayx SAM dump. It ignores
+every non-hash line, so you can feed it the whole tool log. (`pwdump` and
+`secretsdump` are accepted as aliases.)
+
+**Not sure what a parser eats? Run it with no file** and it prints the exact
+format and an example:
+
+```
+$ cm import samdump
+cm import pwdump - expected input:
+  pwdump / SAM / NTDS dump  (aliases: samdump, secretsdump)
+  needs: --host <name|ip>   local SAM dump  -> local accounts
+         --domain <fqdn>    NTDS/domain dump -> domain accounts
+  line:  name:rid:lmhash:nthash:::
+  from:  impacket-secretsdump, nxc --sam/--ntds, ntlmrelayx SAM dump
+  ...
 ```
 
 **Cracking back in:** `cm cracked --from hashcat.potfile` (or `--stdin`) matches
@@ -254,8 +274,8 @@ hashes  --type T     list stored hashes of a type
 todo-crack           crackable, not yet cracked, still live
 # export
 export  users|passwords|pairs|hashes|key
-# import
-import  passwd|shadow|ldapdomaindump|secretsdump|nxc
+# import   (run any with no file to print its expected format)
+import  passwd|shadow|ldapdomaindump|samdump|nxc    # samdump aka pwdump/secretsdump
 # atomic / fix-ups
 add host|domain|service|user|secret · link · access · supersede · observe · unlock · merge
 ```

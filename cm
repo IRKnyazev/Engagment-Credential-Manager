@@ -1213,7 +1213,50 @@ def _read_lines(path):
         raise CmError("cannot read %s: %s" % (path, e))
 
 
+# Input-format cards, shown when an importer is run without the needed arguments
+# so you can see exactly what each parser expects to eat.
+IMPORT_FORMATS = {
+    "passwd": (
+        "  Linux /etc/passwd.  needs: --host <name|ip>\n"
+        "  line:  name:x:uid:gid:gecos:home:shell\n"
+        "  note:  only accounts with a real login shell are imported (nologin skipped)\n"
+        "  e.g.:  cm import passwd --host 10.0.0.5 passwd.txt"),
+    "shadow": (
+        "  Linux /etc/shadow.  needs: --host <name|ip>\n"
+        "  line:  name:$id$salt$hash:...   ($6$=sha512crypt $y$=yescrypt $1$=md5crypt $2*=bcrypt)\n"
+        "  note:  attaches each hash to the matching passwd user; locked (*/!) skipped\n"
+        "  e.g.:  cm import shadow --host 10.0.0.5 shadow.txt"),
+    "ldapdomaindump": (
+        "  ldapdomaindump domain_users.json.  needs: --domain <fqdn>\n"
+        "  format: JSON array of LDAP entries; reads sAMAccountName + description\n"
+        "  note:  creates domain identities only (no secrets)\n"
+        "  e.g.:  cm import ldapdomaindump --domain CORP.LOCAL domain_users.json"),
+    "pwdump": (
+        "  pwdump / SAM / NTDS dump  (aliases: samdump, secretsdump)\n"
+        "  needs: --host <name|ip>   local SAM dump  -> local accounts\n"
+        "         --domain <fqdn>    NTDS/domain dump -> domain accounts\n"
+        "  line:  name:rid:lmhash:nthash:::\n"
+        "  from:  impacket-secretsdump, nxc --sam/--ntds, ntlmrelayx SAM dump\n"
+        "  note:  every other (log) line is ignored, so you can feed the whole output\n"
+        "  e.g.:  cm import samdump --host 192.168.134.212 relay.log"),
+    "nxc": (
+        "  NetExec / CrackMapExec console output.  (host inferred from each line)\n"
+        "  line:  PROTO  IP  PORT  HOSTNAME  [+] DOMAIN\\user:secret (Pwn3d!)\n"
+        "  note:  only [+] successes imported; (Pwn3d!) -> admin; HOSTNAME\\user == local\n"
+        "  e.g.:  nxc smb 10.0.0.5 -u u -p p > smb.nxc ; cm import nxc smb.nxc"),
+}
+
+
+def show_import_format(store, key):
+    """Print the expected input format for an importer (used when args are missing)."""
+    print(store.c.bold("cm import %s - expected input:" % key))
+    print(IMPORT_FORMATS[key])
+    return 0
+
+
 def cmd_import_passwd(store, args):
+    if not getattr(args, "file", None) or not args.host:
+        return show_import_format(store, "passwd")
     hid, _ = store.upsert_host(args.host, os_name="linux")
     kept, skipped = 0, 0
     skipped_names = []
@@ -1250,6 +1293,8 @@ def cmd_import_passwd(store, args):
 
 
 def cmd_import_shadow(store, args):
+    if not getattr(args, "file", None) or not args.host:
+        return show_import_format(store, "shadow")
     hid, _ = store.upsert_host(args.host, os_name="linux")
     attached, skipped = 0, 0
     store.echo_enabled = False
@@ -1284,6 +1329,8 @@ def cmd_import_shadow(store, args):
 
 
 def cmd_import_ldap(store, args):
+    if not getattr(args, "file", None) or not args.domain:
+        return show_import_format(store, "ldapdomaindump")
     import json
     try:
         with open(args.file, "r", errors="replace") as fh:
@@ -1318,13 +1365,13 @@ def cmd_import_ldap(store, args):
 
 
 def cmd_import_secretsdump(store, args):
-    """Parse impacket secretsdump / SAM / NTDS 'name:rid:lm:nt:::' lines."""
+    """Parse a pwdump / SAM / NTDS 'name:rid:lm:nt:::' dump (any log noise ignored)."""
+    if not getattr(args, "file", None) or not (args.domain or args.host):
+        return show_import_format(store, "pwdump")
     if args.domain:
         realm = ("domain", args.domain)
-    elif args.host:
-        realm = ("host", args.host)
     else:
-        raise CmError("secretsdump import needs --domain <fqdn> (NTDS) or --host <name> (SAM)")
+        realm = ("host", args.host)
     rtype, rid = store.resolve_place(realm)
     count = 0
     store.echo_enabled = False
@@ -1353,6 +1400,8 @@ def cmd_import_secretsdump(store, args):
 
 def cmd_import_nxc(store, args):
     """Parse NetExec/CrackMapExec console output lines with [+] successes."""
+    if not getattr(args, "file", None):
+        return show_import_format(store, "nxc")
     count = 0
     store.echo_enabled = False
     for line in _read_lines(args.file):
@@ -1957,18 +2006,21 @@ def build_parser():
     sp.add_argument("--host", help="host where found")
     sp.set_defaults(func=cmd_observe)
 
-    # import
-    sp = sub.add_parser("import", help="bulk import from tool output")
+    # import  (run any of these with no file to see the exact input format)
+    sp = sub.add_parser("import", help="bulk import from tool output (run with no file to see its format)")
     isub = sp.add_subparsers(dest="impkind", required=True)
-    i = isub.add_parser("passwd"); i.add_argument("--host", required=True); i.add_argument("file")
-    i.set_defaults(func=cmd_import_passwd)
-    i = isub.add_parser("shadow"); i.add_argument("--host", required=True); i.add_argument("file")
-    i.set_defaults(func=cmd_import_shadow)
-    i = isub.add_parser("ldapdomaindump"); i.add_argument("--domain", required=True); i.add_argument("file")
-    i.set_defaults(func=cmd_import_ldap)
-    i = isub.add_parser("secretsdump"); i.add_argument("--domain"); i.add_argument("--host")
-    i.add_argument("file"); i.set_defaults(func=cmd_import_secretsdump)
-    i = isub.add_parser("nxc"); i.add_argument("file"); i.set_defaults(func=cmd_import_nxc)
+    i = isub.add_parser("passwd", help="Linux /etc/passwd (login-shell users)")
+    i.add_argument("--host"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_passwd)
+    i = isub.add_parser("shadow", help="Linux /etc/shadow (attach hashes)")
+    i.add_argument("--host"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_shadow)
+    i = isub.add_parser("ldapdomaindump", help="ldapdomaindump domain_users.json")
+    i.add_argument("--domain"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_ldap)
+    i = isub.add_parser("pwdump", aliases=["samdump", "secretsdump"],
+                        help="SAM / NTDS dump, name:rid:lm:nt::: (impacket/nxc/ntlmrelayx)")
+    i.add_argument("--domain"); i.add_argument("--host"); i.add_argument("file", nargs="?")
+    i.set_defaults(func=cmd_import_secretsdump)
+    i = isub.add_parser("nxc", help="NetExec/CrackMapExec console output")
+    i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_nxc)
 
     # queries
     sp = sub.add_parser("users", help="list identities")

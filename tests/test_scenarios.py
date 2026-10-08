@@ -495,6 +495,38 @@ def invariant_merge_local_domain_split(cx):
     assert cx.q1("SELECT COUNT(*) FROM accesses WHERE identity_id=?", (host_sam,)) == 1
 
 
+def invariant_samdump_import(cx):
+    # ntlmrelayx/secretsdump SAM dump: whole log fed in, noise ignored, local
+    # accounts created, shared NT hash deduped. Uses the `samdump` alias.
+    log = os.path.join(cx.workdir, "relay.log")
+    with open(log, "w") as fh:
+        fh.write("[*] (SMB): Authenticating connection ... SUCCEED [1]\n")
+        fh.write("[*] smb://X@192.168.134.212 [1] -> Target system bootKey: 0xdeadbeef\n")
+        fh.write("[*] Dumping local SAM hashes (uid:rid:lmhash:nthash)\n")
+        fh.write("Administrator:500:aad3b435b51404eeaad3b435b51404ee:23ecf03bf097593a4822d0874733c989:::\n")
+        fh.write("files02admin:1000:aad3b435b51404eeaad3b435b51404ee:23ecf03bf097593a4822d0874733c989:::\n")
+        fh.write("anastasia:1001:aad3b435b51404eeaad3b435b51404ee:62aa7a9e9a8de35fefd17c17058a9983:::\n")
+    cx.run("import", "samdump", "--host", "192.168.134.212", log)   # alias of pwdump
+    hid = cx.q1("SELECT id FROM hosts WHERE name='192.168.134.212'")
+    users = sorted(r["username"] for r in cx.qall(
+        "SELECT username FROM identities WHERE realm_type='host' AND realm_id=?", (hid,)))
+    assert users == ["Administrator", "anastasia", "files02admin"], \
+        "only the 3 SAM rows, noise ignored: %s" % users
+    # the shared NT hash is one secret owned by both Administrator and files02admin
+    sid = cx.q1("SELECT id FROM secrets WHERE type='ntlm' AND value='23ecf03bf097593a4822d0874733c989'")
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets WHERE secret_id=?", (sid,)) == 2, \
+        "shared NT hash should dedupe to one secret with two owners"
+
+
+def invariant_import_format_help(cx):
+    # running an importer with no file prints its expected input format (exit 0)
+    out = cx.run("import", "samdump")
+    assert "name:rid:lmhash:nthash" in out, "samdump should print its format:\n" + out
+    for kind in ("passwd", "shadow", "ldapdomaindump", "nxc"):
+        o = cx.run("import", kind)
+        assert "expected input" in o, "%s should print a format card:\n%s" % (kind, o)
+
+
 def invariant_superseded_reconcile(cx):
     # one identity owns two hashes that crack to the same plaintext; supersede the
     # first, crack it, then crack the still-live one -> the plaintext link stays live.
@@ -542,6 +574,8 @@ def main():
         ("INV export passwords excludes planted/passphrase", invariant_export_passwords_clean),
         ("INV passwd tolerates a colon in GECOS", invariant_passwd_extra_colon),
         ("INV merge reconciles a local/domain identity split", invariant_merge_local_domain_split),
+        ("INV samdump import (noise ignored, shared-hash dedupe)", invariant_samdump_import),
+        ("INV importers print their format when run with no file", invariant_import_format_help),
         ("INV superseded reconciles when a live hash yields it", invariant_superseded_reconcile),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
