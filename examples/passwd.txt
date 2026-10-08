@@ -1,0 +1,6 @@
+root:x:0:0:root:/root:/bin/bash
+sysadmin:x:1000:1000:Site Admin,,,:/home/sysadmin:/bin/bash
+svc_deploy:x:1500:1500:deploy service:/opt/deploy:/bin/sh
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin

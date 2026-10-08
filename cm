@@ -1,0 +1,1822 @@
+#!/usr/bin/env python3
+"""
+cm - credential manager for pentest / CTF / OSCP|PNPT|CPTS engagements.
+
+A single-file, stdlib-only tool for tracking usernames, passwords, hashes and
+what you have done with them during an engagement. One SQLite database per
+engagement boundary (e.g. standalone box, or an AD domain).
+
+Design in one breath:
+  * identities  (a WHO)  belong to a realm: a domain, a host, or a service.
+  * secrets     (a WHAT) are passwords / hashes / key-blobs / tickets; unique
+                 by (type, value) - the same secret found twice is ONE row.
+  * identities <-> secrets links say who owns/uses what (origin, superseded).
+  * secrets <-> secrets links say one secret cracks/unlocks another.
+  * accesses say a (identity + secret) logs into a host or service, with a
+                 status (untested/valid/invalid/expired) and a privilege.
+  * observations record every place/way something was found (provenance).
+
+Two command tiers:
+  * everyday macros  : cred / works / fail / cracked / reset  (auto-upsert
+                       everything, and echo the atomic steps they ran so you
+                       learn the model).
+  * atomic commands  : add / link / access / supersede / observe / unlock.
+
+Run `cm --help` or `cm <command> --help`.
+"""
+
+import argparse
+import base64
+import os
+import sqlite3
+import sys
+from datetime import datetime
+
+VERSION = "1.0.0"
+
+# --------------------------------------------------------------------------
+# vocabularies (fixed enums - everything else is free text)
+# --------------------------------------------------------------------------
+
+SECRET_TYPES = [
+    "plaintext",
+    "ntlm", "lm", "netntlmv1", "netntlmv2",
+    "kerberos_tgs", "kerberos_asrep", "dcc2",
+    "sha512crypt", "sha256crypt", "md5crypt", "bcrypt", "yescrypt",
+    "ssh_private_key", "certificate_pfx", "kerberos_ticket",
+    "other",
+]
+
+# secret types that are files/blobs (value is stored base64-encoded)
+BLOB_TYPES = {"ssh_private_key", "certificate_pfx", "kerberos_ticket"}
+
+# hash-like types that are candidate crack targets (todo-crack / export hashes)
+CRACKABLE_TYPES = {
+    "ntlm", "lm", "netntlmv1", "netntlmv2",
+    "kerberos_tgs", "kerberos_asrep", "dcc2",
+    "sha512crypt", "sha256crypt", "md5crypt", "bcrypt", "yescrypt", "other",
+}
+
+REALM_TYPES = ("domain", "host", "service", "unknown")
+ORIGINS = ("discovered", "introduced")
+RELATIONS = ("cracks", "unlocks")
+SCOPES = ("host", "service")
+STATUSES = ("valid", "invalid", "untested", "expired")
+HOST_PRIVS = ("user", "local_admin", "domain_admin", "root")
+
+# protocol -> (default scope, default port). Everything is overridable with
+# --scope / an explicit port; the tool prints every assumption it makes.
+PROTO_DEFAULTS = {
+    "smb": ("host", 445), "rdp": ("host", 3389), "winrm": ("host", 5985),
+    "ssh": ("host", 22), "telnet": ("host", 23), "wmi": ("host", 135),
+    "rpc": ("host", 135), "vnc": ("host", 5900), "ftp": ("host", 21),
+    "ldap": ("host", 389), "pkinit": ("host", 88), "kerberos": ("host", 88),
+    "mysql": ("service", 3306), "mssql": ("service", 1433),
+    "postgres": ("service", 5432), "postgresql": ("service", 5432),
+    "mongodb": ("service", 27017), "redis": ("service", 6379),
+    "oracle": ("service", 1521), "http": ("service", 80),
+    "https": ("service", 443),
+}
+
+# /etc/passwd shells that mean "not a real login user" -> skipped on import
+NOLOGIN_SHELLS = {
+    "/usr/sbin/nologin", "/sbin/nologin", "/usr/bin/nologin",
+    "/bin/false", "/usr/bin/false", "/bin/sync", "/usr/bin/sync",
+    "/dev/null", "",
+}
+
+# /etc/shadow crypt prefixes -> our secret type
+SHADOW_PREFIXES = [
+    ("$6$", "sha512crypt"), ("$5$", "sha256crypt"), ("$1$", "md5crypt"),
+    ("$2a$", "bcrypt"), ("$2b$", "bcrypt"), ("$2y$", "bcrypt"),
+    ("$y$", "yescrypt"),
+]
+
+
+class CmError(Exception):
+    """A user-facing error (printed cleanly, exit 1)."""
+
+
+# --------------------------------------------------------------------------
+# tiny colour helper (no-op unless stdout is a tty and NO_COLOR is unset)
+# --------------------------------------------------------------------------
+
+def _use_color():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+class C:
+    def __init__(self, on):
+        self.on = on
+
+    def _w(self, code, s):
+        return "\033[%sm%s\033[0m" % (code, s) if self.on else s
+
+    def dim(self, s):   return self._w("2", s)
+    def green(self, s): return self._w("32", s)
+    def yellow(self, s):return self._w("33", s)
+    def cyan(self, s):  return self._w("36", s)
+    def red(self, s):   return self._w("31", s)
+    def bold(self, s):  return self._w("1", s)
+
+
+# --------------------------------------------------------------------------
+# schema
+# --------------------------------------------------------------------------
+
+SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS domains (
+    id    INTEGER PRIMARY KEY,
+    fqdn  TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    notes TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS hosts (
+    id    INTEGER PRIMARY KEY,
+    name  TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    os    TEXT,
+    notes TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS services (
+    id      INTEGER PRIMARY KEY,
+    host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    port    INTEGER NOT NULL,
+    service TEXT NOT NULL DEFAULT '',
+    notes   TEXT NOT NULL DEFAULT '',
+    UNIQUE(host_id, port, service)
+);
+
+CREATE TABLE IF NOT EXISTS identities (
+    id          INTEGER PRIMARY KEY,
+    username    TEXT NOT NULL,
+    realm_type  TEXT NOT NULL CHECK(realm_type IN ('domain','host','service','unknown')),
+    realm_id    INTEGER NOT NULL DEFAULT 0,
+    uid         INTEGER,
+    shell       TEXT,
+    description TEXT NOT NULL DEFAULT '',
+    notes       TEXT NOT NULL DEFAULT '',
+    UNIQUE(username, realm_type, realm_id)
+);
+
+CREATE TABLE IF NOT EXISTS secrets (
+    id         INTEGER PRIMARY KEY,
+    type       TEXT NOT NULL CHECK(type IN (
+        'plaintext','ntlm','lm','netntlmv1','netntlmv2','kerberos_tgs',
+        'kerberos_asrep','dcc2','sha512crypt','sha256crypt','md5crypt',
+        'bcrypt','yescrypt','ssh_private_key','certificate_pfx',
+        'kerberos_ticket','other')),
+    value      TEXT NOT NULL,
+    label      TEXT NOT NULL DEFAULT '',
+    filename   TEXT,
+    expires_at TEXT,
+    notes      TEXT NOT NULL DEFAULT '',
+    UNIQUE(type, value)
+);
+
+CREATE TABLE IF NOT EXISTS identity_secrets (
+    id          INTEGER PRIMARY KEY,
+    identity_id INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+    secret_id   INTEGER NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+    origin      TEXT NOT NULL DEFAULT 'discovered' CHECK(origin IN ('discovered','introduced')),
+    superseded  INTEGER NOT NULL DEFAULT 0 CHECK(superseded IN (0,1)),
+    notes       TEXT NOT NULL DEFAULT '',
+    UNIQUE(identity_id, secret_id)
+);
+
+CREATE TABLE IF NOT EXISTS secret_links (
+    id             INTEGER PRIMARY KEY,
+    from_secret_id INTEGER NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+    to_secret_id   INTEGER NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+    relation       TEXT NOT NULL CHECK(relation IN ('cracks','unlocks')),
+    UNIQUE(from_secret_id, to_secret_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS accesses (
+    id          INTEGER PRIMARY KEY,
+    identity_id INTEGER NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+    secret_id   INTEGER NOT NULL REFERENCES secrets(id) ON DELETE CASCADE,
+    host_id     INTEGER REFERENCES hosts(id) ON DELETE CASCADE,
+    service_id  INTEGER REFERENCES services(id) ON DELETE CASCADE,
+    scope       TEXT NOT NULL CHECK(scope IN ('host','service')),
+    protocol    TEXT NOT NULL DEFAULT '',
+    privilege   TEXT NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'untested' CHECK(status IN ('valid','invalid','untested','expired')),
+    notes       TEXT NOT NULL DEFAULT '',
+    CHECK ((scope='host'    AND host_id    IS NOT NULL AND service_id IS NULL) OR
+           (scope='service' AND service_id IS NOT NULL AND host_id    IS NULL)),
+    UNIQUE(identity_id, secret_id, host_id, service_id, protocol)
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+    id          INTEGER PRIMARY KEY,
+    found_at    TEXT NOT NULL,
+    method      TEXT NOT NULL DEFAULT '',
+    host_id     INTEGER REFERENCES hosts(id) ON DELETE SET NULL,
+    identity_id INTEGER REFERENCES identities(id) ON DELETE CASCADE,
+    secret_id   INTEGER REFERENCES secrets(id) ON DELETE CASCADE,
+    notes       TEXT NOT NULL DEFAULT '',
+    CHECK (identity_id IS NOT NULL OR secret_id IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_obs
+    ON observations(method, IFNULL(host_id,0), IFNULL(identity_id,0), IFNULL(secret_id,0));
+"""
+
+
+# --------------------------------------------------------------------------
+# parsing helpers
+# --------------------------------------------------------------------------
+
+def split_host_port(s):
+    """'10.0.0.5:1433' -> ('10.0.0.5', 1433); '10.0.0.5' -> ('10.0.0.5', None)."""
+    s = s.strip()
+    if ":" in s:
+        host, _, port = s.rpartition(":")
+        if port.isdigit():
+            return host, int(port)
+    return s, None
+
+
+def parse_principal(token):
+    """Parse a principal token into (username, realm_hint).
+
+    realm_hint is one of:
+        ('domain', fqdn)
+        ('host', name)
+        ('service', host, port)
+        (None,)           -> no realm encoded in the token
+
+    Rules:
+        DOMAIN\\user          -> domain  (backslash means a Windows domain logon)
+        user@host             -> host    (the unambiguous local-account form)
+        user@host:port        -> service (that specific service)
+        user                  -> no realm encoded (caller supplies --realm)
+    """
+    if "\\" in token:
+        left, _, user = token.partition("\\")
+        return user, ("domain", left)
+    if "@" in token:
+        user, _, right = token.rpartition("@")
+        host, port = split_host_port(right)
+        if port is not None:
+            return user, ("service", host, port)
+        return user, ("host", host)
+    return token, (None,)
+
+
+def parse_realm_opt(spec):
+    """Parse --realm 'domain:X' / 'host:X' / 'service:HOST:PORT'."""
+    kind, _, rest = spec.partition(":")
+    kind = kind.lower()
+    if kind == "domain":
+        if not rest:
+            raise CmError("--realm domain:<fqdn> needs a domain")
+        return ("domain", rest)
+    if kind == "host":
+        if not rest:
+            raise CmError("--realm host:<name> needs a host")
+        return ("host", rest)
+    if kind == "service":
+        host, port = split_host_port(rest)
+        if port is None:
+            raise CmError("--realm service:<host>:<port> needs host and port")
+        return ("service", host, port)
+    raise CmError("--realm must be domain:X, host:X or service:HOST:PORT")
+
+
+# --------------------------------------------------------------------------
+# store: db connection + atomic operations (each echoes what it did)
+# --------------------------------------------------------------------------
+
+class Store:
+    def __init__(self, path, color, echo=True):
+        self.path = path
+        self.c = color
+        self.echo_enabled = echo
+        new = not os.path.exists(path)
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.conn.executescript(SCHEMA)
+        self.conn.commit()
+        self._was_new = new
+        self._buf = []  # echoes are buffered and flushed only on a successful commit
+
+    # -- output -------------------------------------------------------------
+    def atom(self, verb, text):
+        """Queue one underlying atomic step (teaching aid). Flushed on commit()."""
+        if not self.echo_enabled:
+            return
+        mark = {"+": self.c.green("+"), "~": self.c.yellow("~"),
+                "=": self.c.dim("="), "-": self.c.yellow("-")}.get(verb, verb)
+        line = "  %s %s" % (mark, text)
+        if verb == "=":
+            line = self.c.dim(line)
+        self._buf.append(line)
+
+    def note(self, text):
+        """Queue an assumption / informational line. Flushed on commit()."""
+        if self.echo_enabled:
+            self._buf.append(self.c.cyan(text))
+
+    def commit(self):
+        # persist first, then show the user exactly what was committed
+        self.conn.commit()
+        for line in self._buf:
+            print(line)
+        self._buf = []
+
+    # -- places -------------------------------------------------------------
+    def upsert_domain(self, fqdn):
+        row = self.conn.execute("SELECT * FROM domains WHERE fqdn=?", (fqdn,)).fetchone()
+        if row:
+            return row["id"], False
+        cur = self.conn.execute("INSERT INTO domains(fqdn) VALUES(?)", (fqdn,))
+        self.atom("+", "domain %s" % fqdn)
+        return cur.lastrowid, True
+
+    def upsert_host(self, name, os_name=None):
+        row = self.conn.execute("SELECT * FROM hosts WHERE name=?", (name,)).fetchone()
+        if row:
+            if os_name and not row["os"]:
+                self.conn.execute("UPDATE hosts SET os=? WHERE id=?", (os_name, row["id"]))
+                self.atom("~", "host %s (os=%s)" % (name, os_name))
+            return row["id"], False
+        cur = self.conn.execute("INSERT INTO hosts(name, os) VALUES(?,?)", (name, os_name))
+        self.atom("+", "host %s" % name + ((" (os=%s)" % os_name) if os_name else ""))
+        return cur.lastrowid, True
+
+    def upsert_service(self, host_id, port, service=""):
+        row = self.conn.execute(
+            "SELECT * FROM services WHERE host_id=? AND port=? AND service=?",
+            (host_id, port, service)).fetchone()
+        if row:
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO services(host_id, port, service) VALUES(?,?,?)",
+            (host_id, port, service))
+        hn = self._host_name(host_id)
+        self.atom("+", "service %s:%d%s" % (hn, port, (" (%s)" % service) if service else ""))
+        return cur.lastrowid, True
+
+    def _host_name(self, host_id):
+        r = self.conn.execute("SELECT name FROM hosts WHERE id=?", (host_id,)).fetchone()
+        return r["name"] if r else "?"
+
+    def resolve_place(self, realm_hint, service_name=""):
+        """Turn a realm hint into (realm_type, realm_id), creating places."""
+        kind = realm_hint[0]
+        if kind == "domain":
+            did, _ = self.upsert_domain(realm_hint[1])
+            return "domain", did
+        if kind == "host":
+            hid, _ = self.upsert_host(realm_hint[1])
+            return "host", hid
+        if kind == "service":
+            hid, _ = self.upsert_host(realm_hint[1])
+            sid, _ = self.upsert_service(hid, realm_hint[2], service_name)
+            return "service", sid
+        return "unknown", 0
+
+    # -- identities ---------------------------------------------------------
+    def upsert_identity(self, username, realm_type, realm_id,
+                        uid=None, shell=None, description=None):
+        row = self.conn.execute(
+            "SELECT * FROM identities WHERE username=? AND realm_type=? AND realm_id=?",
+            (username, realm_type, realm_id)).fetchone()
+        label = self.identity_label(username, realm_type, realm_id)
+        if row:
+            sets, vals = [], []
+            if uid is not None and row["uid"] is None:
+                sets.append("uid=?"); vals.append(uid)
+            if shell is not None and not row["shell"]:
+                sets.append("shell=?"); vals.append(shell)
+            if description and not row["description"]:
+                sets.append("description=?"); vals.append(description)
+            if sets:
+                vals.append(row["id"])
+                self.conn.execute("UPDATE identities SET %s WHERE id=?" % ",".join(sets), vals)
+                self.atom("~", "user %s (metadata)" % label)
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO identities(username, realm_type, realm_id, uid, shell, description) "
+            "VALUES(?,?,?,?,?,?)",
+            (username, realm_type, realm_id, uid, shell, description or ""))
+        self.atom("+", "user %s" % label)
+        return cur.lastrowid, True
+
+    def identity_label(self, username, realm_type, realm_id):
+        uname = username if username != "" else "(null)"
+        if realm_type == "domain":
+            r = self.conn.execute("SELECT fqdn FROM domains WHERE id=?", (realm_id,)).fetchone()
+            return "%s\\%s" % (r["fqdn"] if r else "?", uname)
+        if realm_type == "host":
+            return "%s@%s" % (uname, self._host_name(realm_id))
+        if realm_type == "service":
+            r = self.conn.execute(
+                "SELECT h.name AS hn, s.port AS p FROM services s "
+                "JOIN hosts h ON h.id=s.host_id WHERE s.id=?", (realm_id,)).fetchone()
+            if r:
+                return "%s@%s:%d" % (uname, r["hn"], r["p"])
+            return uname
+        return uname
+
+    def identity_label_row(self, ident):
+        return self.identity_label(ident["username"], ident["realm_type"], ident["realm_id"])
+
+    # -- secrets ------------------------------------------------------------
+    def upsert_secret(self, stype, value, label="", filename=None, expires=None):
+        row = self.conn.execute(
+            "SELECT * FROM secrets WHERE type=? AND value=?", (stype, value)).fetchone()
+        if row:
+            sets, vals = [], []
+            if expires and not row["expires_at"]:
+                sets.append("expires_at=?"); vals.append(expires)
+            if filename and not row["filename"]:
+                sets.append("filename=?"); vals.append(filename)
+            if label and not row["label"]:
+                sets.append("label=?"); vals.append(label)
+            if sets:
+                vals.append(row["id"])
+                self.conn.execute("UPDATE secrets SET %s WHERE id=?" % ",".join(sets), vals)
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO secrets(type, value, label, filename, expires_at) VALUES(?,?,?,?,?)",
+            (stype, value, label, filename, expires))
+        self.atom("+", "secret #%d %s%s" % (cur.lastrowid, stype, self._secret_tag(stype, value)))
+        return cur.lastrowid, True
+
+    def _secret_tag(self, stype, value):
+        if stype in BLOB_TYPES:
+            return " (blob)"
+        return " %s" % mask(value)
+
+    def secret_short(self, srow):
+        return "#%d %s %s" % (srow["id"], srow["type"],
+                              "(blob)" if srow["type"] in BLOB_TYPES else mask(srow["value"]))
+
+    # -- links --------------------------------------------------------------
+    def link_identity_secret(self, identity_id, secret_id, origin="discovered",
+                             superseded=0):
+        row = self.conn.execute(
+            "SELECT * FROM identity_secrets WHERE identity_id=? AND secret_id=?",
+            (identity_id, secret_id)).fetchone()
+        ilabel = self._ident_label_by_id(identity_id)
+        slabel = self._secret_label_by_id(secret_id)
+        if row:
+            if origin == "introduced" and row["origin"] != "introduced":
+                self.conn.execute("UPDATE identity_secrets SET origin='introduced' WHERE id=?",
+                                  (row["id"],))
+                self.atom("~", "link %s <-> %s (origin=introduced)" % (ilabel, slabel))
+            else:
+                self.atom("=", "link %s <-> %s" % (ilabel, slabel))
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO identity_secrets(identity_id, secret_id, origin, superseded) "
+            "VALUES(?,?,?,?)", (identity_id, secret_id, origin, superseded))
+        extra = " origin=introduced" if origin == "introduced" else ""
+        self.atom("+", "link %s <-> %s%s" % (ilabel, slabel, extra))
+        return cur.lastrowid, True
+
+    def link_secrets(self, from_id, to_id, relation):
+        row = self.conn.execute(
+            "SELECT * FROM secret_links WHERE from_secret_id=? AND to_secret_id=? AND relation=?",
+            (from_id, to_id, relation)).fetchone()
+        if row:
+            self.atom("=", "%s %s -> %s" % (relation, self._secret_label_by_id(from_id),
+                                            self._secret_label_by_id(to_id)))
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO secret_links(from_secret_id, to_secret_id, relation) VALUES(?,?,?)",
+            (from_id, to_id, relation))
+        self.atom("+", "%s %s -> %s" % (relation, self._secret_label_by_id(from_id),
+                                        self._secret_label_by_id(to_id)))
+        return cur.lastrowid, True
+
+    def _ident_label_by_id(self, identity_id):
+        r = self.conn.execute("SELECT * FROM identities WHERE id=?", (identity_id,)).fetchone()
+        return self.identity_label_row(r) if r else "?"
+
+    def _secret_label_by_id(self, secret_id):
+        r = self.conn.execute("SELECT * FROM secrets WHERE id=?", (secret_id,)).fetchone()
+        return self.secret_short(r) if r else "?"
+
+    # -- accesses -----------------------------------------------------------
+    def upsert_access(self, identity_id, secret_id, scope, host_id, service_id,
+                      protocol="", privilege="", status="untested"):
+        row = self.conn.execute(
+            "SELECT * FROM accesses WHERE identity_id=? AND secret_id=? AND "
+            "IFNULL(host_id,0)=IFNULL(?,0) AND IFNULL(service_id,0)=IFNULL(?,0) AND protocol=?",
+            (identity_id, secret_id, host_id, service_id, protocol)).fetchone()
+        tgt = self._target_label(scope, host_id, service_id)
+        ilabel = self._ident_label_by_id(identity_id)
+        if row:
+            sets, vals, changed = [], [], []
+            if status != row["status"]:
+                sets.append("status=?"); vals.append(status); changed.append("status=%s" % status)
+            if privilege and privilege != row["privilege"]:
+                sets.append("privilege=?"); vals.append(privilege); changed.append("priv=%s" % privilege)
+            if sets:
+                vals.append(row["id"])
+                self.conn.execute("UPDATE accesses SET %s WHERE id=?" % ",".join(sets), vals)
+                self.atom("~", "access %s -> %s [%s]" % (ilabel, tgt, ", ".join(changed)))
+            else:
+                self.atom("=", "access %s -> %s" % (ilabel, tgt))
+            return row["id"], False
+        cur = self.conn.execute(
+            "INSERT INTO accesses(identity_id, secret_id, host_id, service_id, scope, "
+            "protocol, privilege, status) VALUES(?,?,?,?,?,?,?,?)",
+            (identity_id, secret_id, host_id, service_id, scope, protocol, privilege, status))
+        bits = status
+        if privilege:
+            bits += ", " + privilege
+        if protocol:
+            tgt = "%s/%s" % (protocol, tgt)
+        self.atom("+", "access %s -> %s [%s]" % (ilabel, tgt, bits))
+        return cur.lastrowid, True
+
+    def _target_label(self, scope, host_id, service_id):
+        if scope == "service" and service_id:
+            r = self.conn.execute(
+                "SELECT h.name AS hn, s.port AS p, s.service AS sv FROM services s "
+                "JOIN hosts h ON h.id=s.host_id WHERE s.id=?", (service_id,)).fetchone()
+            if r:
+                return "%s:%d" % (r["hn"], r["p"])
+        if host_id:
+            return self._host_name(host_id)
+        return "?"
+
+    # -- observations -------------------------------------------------------
+    def add_observation(self, method, host_id=None, identity_id=None, secret_id=None):
+        if identity_id is None and secret_id is None:
+            return
+        try:
+            self.conn.execute(
+                "INSERT INTO observations(found_at, method, host_id, identity_id, secret_id) "
+                "VALUES(?,?,?,?,?)",
+                (now_iso(), method, host_id, identity_id, secret_id))
+            self.atom("+", "observation %s" % (method or "(note)"))
+        except sqlite3.IntegrityError:
+            pass  # duplicate observation -> idempotent no-op
+
+    # -- resolvers ----------------------------------------------------------
+    def resolve_secret_ref(self, ref):
+        """Resolve a secret reference: '#id', 'type:valueprefix', or value prefix."""
+        ref = ref.strip()
+        if ref.startswith("#"):
+            try:
+                sid = int(ref[1:])
+            except ValueError:
+                raise CmError("bad secret id %r" % ref)
+            row = self.conn.execute("SELECT * FROM secrets WHERE id=?", (sid,)).fetchone()
+            if not row:
+                raise CmError("no secret #%d" % sid)
+            return row
+        stype = None
+        needle = ref
+        head, sep, rest = ref.partition(":")
+        if sep and head in SECRET_TYPES:
+            stype, needle = head, rest
+        # exact value match first
+        if stype:
+            rows = self.conn.execute(
+                "SELECT * FROM secrets WHERE type=? AND value=?", (stype, needle)).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM secrets WHERE value=?", (needle,)).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        # prefix match
+        like = needle.replace("%", r"\%").replace("_", r"\_") + "%"
+        if stype:
+            rows = self.conn.execute(
+                "SELECT * FROM secrets WHERE type=? AND value LIKE ? ESCAPE '\\'",
+                (stype, like)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM secrets WHERE value LIKE ? ESCAPE '\\'", (like,)).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        if not rows:
+            raise CmError("no secret matches %r (try #id, or `cm hashes`)" % ref)
+        opts = ", ".join("#%d %s" % (r["id"], r["type"]) for r in rows[:8])
+        raise CmError("ambiguous secret %r - matches: %s (use #id)" % (ref, opts))
+
+    def find_identity(self, username, realm_type, realm_id):
+        return self.conn.execute(
+            "SELECT * FROM identities WHERE username=? AND realm_type=? AND realm_id=?",
+            (username, realm_type, realm_id)).fetchone()
+
+    def live_secrets_for_identity(self, identity_id):
+        return self.conn.execute(
+            "SELECT s.* FROM identity_secrets il JOIN secrets s ON s.id=il.secret_id "
+            "WHERE il.identity_id=? AND il.superseded=0", (identity_id,)).fetchall()
+
+
+# --------------------------------------------------------------------------
+# small utilities
+# --------------------------------------------------------------------------
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def mask(value):
+    """Short, safe-ish preview of a secret value for echo lines."""
+    if value == "":
+        return "(blank)"
+    if len(value) <= 24:
+        return value
+    return value[:21] + "..."
+
+
+def read_blob_file(path):
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        raise CmError("cannot read %s: %s" % (path, e))
+    return base64.b64encode(data).decode("ascii"), os.path.basename(path)
+
+
+def secret_from_args(args):
+    """Build (type, value, label, filename, expires) from secret flags, or None."""
+    given = [bool(getattr(args, "password", None) is not None),
+             bool(getattr(args, "nt", None)),
+             bool(getattr(args, "hash", None)),
+             bool(getattr(args, "key", None)),
+             bool(getattr(args, "pfx", None)),
+             bool(getattr(args, "ticket", None))]
+    if sum(given) == 0:
+        return None
+    if sum(given) > 1:
+        raise CmError("give only one of --pass/--nt/--hash/--key/--pfx/--ticket")
+    label = getattr(args, "label", "") or ""
+    expires = getattr(args, "expires", None)
+    if getattr(args, "password", None) is not None:
+        return ("plaintext", args.password, label, None, None)
+    if getattr(args, "nt", None):
+        return ("ntlm", args.nt.strip(), label, None, None)
+    if getattr(args, "hash", None):
+        htype, sep, hval = args.hash.partition(":")
+        if not sep:
+            raise CmError("--hash must be TYPE:VALUE, e.g. kerberos_tgs:'$krb5tgs$...'")
+        if htype not in SECRET_TYPES:
+            raise CmError("unknown hash type %r (valid: %s)" % (htype, ", ".join(sorted(CRACKABLE_TYPES))))
+        return (htype, hval, label, None, None)
+    if getattr(args, "key", None):
+        b64, fn = read_blob_file(args.key)
+        return ("ssh_private_key", b64, label, fn, None)
+    if getattr(args, "pfx", None):
+        b64, fn = read_blob_file(args.pfx)
+        return ("certificate_pfx", b64, label, fn, None)
+    if getattr(args, "ticket", None):
+        b64, fn = read_blob_file(args.ticket)
+        return ("kerberos_ticket", b64, label, fn, expires)
+    return None
+
+
+def resolve_identity(store, args, need_realm=True):
+    """Resolve the principal + realm from args into (username, realm_type, realm_id)."""
+    token = getattr(args, "identity", None)
+    null_flag = getattr(args, "null", False)
+    realm_opt = getattr(args, "realm", None)
+    if null_flag:
+        username = ""
+        hint = (None,)
+    elif token is None:
+        raise CmError("an identity is required (e.g. 'CORP\\jsmith', 'bob@10.0.0.5', or --null)")
+    else:
+        username, hint = parse_principal(token)
+
+    svc_name = ""
+    if realm_opt:
+        realm_hint = parse_realm_opt(realm_opt)
+    elif hint[0] is not None:
+        realm_hint = hint
+    elif null_flag and getattr(args, "at", None):
+        # infer realm for a null/anonymous session from its target, using the
+        # same scope decision the access target uses (so smb:445 -> host, not service)
+        scope, host, port = decide_scope(args.at, getattr(args, "proto", None),
+                                         getattr(args, "scope", None))
+        realm_hint = ("service", host, port) if scope == "service" and port else ("host", host)
+    else:
+        realm_hint = ("unknown",)
+        if need_realm:
+            store.note("[assumed: realm unknown for %r - pass --realm to pin it]"
+                       % (username or "(null)"))
+    rtype, rid = store.resolve_place(realm_hint, svc_name)
+    return username, rtype, rid
+
+
+def decide_scope(at, proto, scope_opt):
+    """Pure decision: (scope, host, port) from a target string + proto + override.
+
+    No side effects - used both for access targets and for inferring a
+    null/anonymous session's realm, so the two always agree.
+    """
+    host, port = split_host_port(at)
+    proto = (proto or "").lower()
+    if scope_opt:
+        scope = scope_opt
+    elif proto in PROTO_DEFAULTS:
+        scope = PROTO_DEFAULTS[proto][0]
+    elif port is not None:
+        scope = "service"
+    else:
+        scope = "host"
+    if scope == "service" and port is None and proto in PROTO_DEFAULTS and PROTO_DEFAULTS[proto][1]:
+        port = PROTO_DEFAULTS[proto][1]
+    return scope, host, port
+
+
+def resolve_target(store, args, allow_missing=False):
+    """Resolve --at into (scope, host_id, service_id), creating places. Prints assumptions."""
+    at = getattr(args, "at", None)
+    if not at:
+        if allow_missing:
+            return None
+        raise CmError("--at HOST[:PORT] is required")
+    proto = (getattr(args, "proto", None) or "").lower()
+    scope_opt = getattr(args, "scope", None)
+    raw_host, raw_port = split_host_port(at)
+    scope, host, port = decide_scope(at, proto, scope_opt)
+
+    assumed = []
+    if not scope_opt and proto in PROTO_DEFAULTS and (scope == "service") != (raw_port is not None):
+        assumed.append("%s -> %s-auth (scope=%s)" % (proto, scope, scope))
+    elif not scope_opt and proto and proto not in PROTO_DEFAULTS and raw_port is None:
+        assumed.append("%s -> host-auth (scope=host)" % proto)
+
+    hid, _ = store.upsert_host(host)
+    if scope == "host":
+        if assumed:
+            store.note("[assumed: %s]" % "; ".join(assumed))
+        return ("host", hid, None)
+
+    if port is None:
+        raise CmError("service access needs a port: use --at %s:PORT" % host)
+    if raw_port is None:
+        assumed.append("port %d for %s" % (port, proto))
+    sid, _ = store.upsert_service(hid, port, proto if proto else "")
+    if assumed:
+        store.note("[assumed: %s]" % "; ".join(assumed))
+    return ("service", None, sid)
+
+
+def pick_secret_for_identity(store, args, identity_id, action):
+    """For works/fail/access/supersede: use a secret flag, --secret, or infer."""
+    spec = secret_from_args(args)
+    if spec:
+        sid, _ = store.upsert_secret(*spec)
+        return sid
+    if getattr(args, "secret", None):
+        return store.resolve_secret_ref(args.secret)["id"]
+    live = store.live_secrets_for_identity(identity_id)
+    if len(live) == 1:
+        return live[0]["id"]
+    if len(live) > 1:
+        # common case: a hash was cracked, so the identity now holds the hash AND
+        # the plaintext. Prefer the single plaintext - you log in with the password.
+        plains = [s for s in live if s["type"] == "plaintext"]
+        if len(plains) == 1:
+            return plains[0]["id"]
+        opts = ", ".join(store.secret_short(s) for s in live)
+        raise CmError("identity has several live secrets - pick one with --secret: %s" % opts)
+    # no live secret
+    if getattr(args, "null", False):
+        sid, _ = store.upsert_secret("plaintext", "")  # null/anonymous session
+        return sid
+    raise CmError("no secret known for this identity - give --pass/--nt/--hash/--secret")
+
+
+# --------------------------------------------------------------------------
+# macro commands
+# --------------------------------------------------------------------------
+
+def cmd_cred(store, args):
+    username, rtype, rid = resolve_identity(store, args)
+    spec = secret_from_args(args)
+    if spec is None:
+        raise CmError("cred needs a secret: --pass/--nt/--hash/--key/--pfx/--ticket "
+                      "(use `cm add user` for a bare identity)")
+    iid, _ = store.upsert_identity(username, rtype, rid,
+                                   uid=getattr(args, "uid", None),
+                                   shell=getattr(args, "shell", None),
+                                   description=getattr(args, "desc", None))
+    sid, _ = store.upsert_secret(*spec)
+    store.link_identity_secret(iid, sid, origin=getattr(args, "origin", "discovered") or "discovered")
+    if getattr(args, "src", None):
+        store.add_observation(args.src, identity_id=iid, secret_id=sid)
+    if getattr(args, "at", None):
+        scope, hid, svid = resolve_target(store, args)
+        status = getattr(args, "status", None) or "untested"
+        store.upsert_access(iid, sid, scope, hid, svid,
+                            protocol=(getattr(args, "proto", None) or ""),
+                            privilege=(getattr(args, "priv", None) or ""),
+                            status=status)
+    store.commit()
+
+
+def _works_fail(store, args, status):
+    username, rtype, rid = resolve_identity(store, args)
+    iid, _ = store.upsert_identity(username, rtype, rid)
+    sid = pick_secret_for_identity(store, args, iid, status)
+    store.link_identity_secret(iid, sid)
+    targets = [t.strip() for t in args.at.split(",") if t.strip()]
+    if not targets:
+        raise CmError("--at HOST[:PORT] is required")
+    for tgt in targets:
+        args.at = tgt
+        scope, hid, svid = resolve_target(store, args)
+        store.upsert_access(iid, sid, scope, hid, svid,
+                            protocol=(getattr(args, "proto", None) or ""),
+                            privilege=(getattr(args, "priv", None) or ""),
+                            status=status)
+    if getattr(args, "src", None):
+        store.add_observation(args.src, identity_id=iid, secret_id=sid)
+    store.commit()
+
+
+def cmd_works(store, args):
+    _works_fail(store, args, "valid")
+
+
+def cmd_fail(store, args):
+    _works_fail(store, args, "invalid")
+
+
+def cmd_reset(store, args):
+    username, rtype, rid = resolve_identity(store, args)
+    spec = secret_from_args(args)
+    if spec is None:
+        raise CmError("reset needs the new password/hash: --pass/--nt/--hash")
+    iid, created = store.upsert_identity(username, rtype, rid)
+    if not created:
+        live = store.live_secrets_for_identity(iid)
+        for s in live:
+            store.conn.execute(
+                "UPDATE identity_secrets SET superseded=1 WHERE identity_id=? AND secret_id=?",
+                (iid, s["id"]))
+            store.atom("-", "supersede %s <-> %s" % (store._ident_label_by_id(iid),
+                                                     store.secret_short(s)))
+    sid, _ = store.upsert_secret(*spec)
+    store.link_identity_secret(iid, sid, origin="introduced")
+    if getattr(args, "src", None):
+        store.add_observation(args.src, identity_id=iid, secret_id=sid)
+    store.commit()
+
+
+def cmd_supersede(store, args):
+    username, rtype, rid = resolve_identity(store, args, need_realm=True)
+    ident = store.find_identity(username, rtype, rid)
+    if not ident:
+        raise CmError("no such identity: %s" % (args.identity or "(null)"))
+    iid = ident["id"]
+    if getattr(args, "secret", None):
+        sid = store.resolve_secret_ref(args.secret)["id"]
+    else:
+        live = store.live_secrets_for_identity(iid)
+        if len(live) == 1:
+            sid = live[0]["id"]
+        elif not live:
+            raise CmError("identity has no live secrets to supersede")
+        else:
+            opts = ", ".join(store.secret_short(s) for s in live)
+            raise CmError("several live secrets - pick with --secret: %s" % opts)
+    row = store.conn.execute(
+        "SELECT * FROM identity_secrets WHERE identity_id=? AND secret_id=?",
+        (iid, sid)).fetchone()
+    if not row:
+        raise CmError("that secret is not linked to this identity")
+    store.conn.execute("UPDATE identity_secrets SET superseded=1 WHERE id=?", (row["id"],))
+    store.atom("-", "supersede %s <-> %s" % (store._ident_label_by_id(iid),
+                                             store._secret_label_by_id(sid)))
+    store.commit()
+
+
+def cmd_cracked(store, args):
+    # bulk from potfile / stdin, or a single ref + plaintext
+    if getattr(args, "from_file", None) or getattr(args, "stdin", False):
+        _cracked_bulk(store, args)
+        return
+    if not args.ref or args.plaintext is None:
+        raise CmError("usage: cm cracked <hash-ref> --pass PLAINTEXT   |   "
+                      "cm cracked --from file.potfile   |   cm cracked --stdin")
+    hashrow = store.resolve_secret_ref(args.ref)
+    _apply_crack(store, hashrow, args.plaintext)
+    store.commit()
+
+
+def _apply_crack(store, hashrow, plaintext):
+    if hashrow["type"] == "plaintext":
+        raise CmError("#%d is already a plaintext secret" % hashrow["id"])
+    pt_id, created = store.upsert_secret("plaintext", plaintext)
+    if not created:
+        store.atom("=", "secret #%d plaintext %s (already present)" % (pt_id, mask(plaintext)))
+    store.link_secrets(pt_id, hashrow["id"], "cracks")
+    # propagate the plaintext to every owner of the hash, copying superseded state
+    owners = store.conn.execute(
+        "SELECT * FROM identity_secrets WHERE secret_id=?", (hashrow["id"],)).fetchall()
+    for o in owners:
+        existing = store.conn.execute(
+            "SELECT * FROM identity_secrets WHERE identity_id=? AND secret_id=?",
+            (o["identity_id"], pt_id)).fetchone()
+        if not existing:
+            store.conn.execute(
+                "INSERT INTO identity_secrets(identity_id, secret_id, origin, superseded) "
+                "VALUES(?,?,?,?)", (o["identity_id"], pt_id, o["origin"], o["superseded"]))
+            tag = " (superseded)" if o["superseded"] else ""
+            store.atom("+", "link %s <-> secret #%d plaintext%s" % (
+                store._ident_label_by_id(o["identity_id"]), pt_id, tag))
+    return pt_id
+
+
+def _cracked_bulk(store, args):
+    if getattr(args, "stdin", False):
+        lines = sys.stdin.read().splitlines()
+        source = "<stdin>"
+    else:
+        try:
+            with open(args.from_file, "r", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError as e:
+            raise CmError("cannot read %s: %s" % (args.from_file, e))
+        source = args.from_file
+    # all crackable hashes currently stored, longest value first (so we match the
+    # most specific hash when one value is a prefix of another)
+    hashes = store.conn.execute(
+        "SELECT * FROM secrets WHERE type!='plaintext' AND type NOT IN "
+        "('ssh_private_key','certificate_pfx','kerberos_ticket') "
+        "ORDER BY length(value) DESC").fetchall()
+    new_links = 0
+    already = 0
+    skipped = []
+    store.echo_enabled = False  # keep bulk quiet; print a summary instead
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line:
+            continue
+        matched = None
+        plaintext = None
+        for h in hashes:
+            if line.startswith(h["value"] + ":"):
+                matched = h
+                plaintext = line[len(h["value"]) + 1:]
+                break
+        if matched is None:
+            skipped.append(line)
+            continue
+        existing = store.conn.execute(
+            "SELECT sl.id FROM secret_links sl JOIN secrets s ON s.id=sl.from_secret_id "
+            "WHERE sl.to_secret_id=? AND sl.relation='cracks' AND s.type='plaintext' AND s.value=?",
+            (matched["id"], plaintext)).fetchone()
+        if existing:
+            already += 1
+            continue
+        _apply_crack(store, matched, plaintext)
+        new_links += 1
+    store.commit()
+    store.echo_enabled = True
+    c = store.c
+    print("%s %s" % (c.bold("cracked:"), source))
+    print("  %s new, %s already linked" % (c.green(str(new_links)), c.dim(str(already))))
+    if skipped:
+        print(c.yellow("  %d cracked hash(es) not in db - did you forget to add them?" % len(skipped)))
+        for s in skipped:
+            print("    " + s)
+
+
+def cmd_unlock(store, args):
+    # resolve the protected secret (key/pfx) and the passphrase plaintext
+    ref = args.key or args.pfx or args.secret
+    if not ref:
+        raise CmError("unlock needs --key/--pfx/--secret <ref>")
+    protected = store.resolve_secret_ref(ref)
+    if args.passphrase is None and not args.with_secret:
+        raise CmError("give --passphrase VALUE (or --with <plaintext-ref>)")
+    if args.with_secret:
+        pt = store.resolve_secret_ref(args.with_secret)
+        if pt["type"] != "plaintext":
+            raise CmError("--with must reference a plaintext secret")
+        pt_id = pt["id"]
+    else:
+        pt_id, _ = store.upsert_secret("plaintext", args.passphrase)
+    store.link_secrets(pt_id, protected["id"], "unlocks")
+    store.note("[note: passphrase links to the key, not to any login]")
+    store.commit()
+
+
+# --------------------------------------------------------------------------
+# atomic commands
+# --------------------------------------------------------------------------
+
+def cmd_add_host(store, args):
+    store.upsert_host(args.name, getattr(args, "os", None))
+    store.commit()
+
+
+def cmd_add_domain(store, args):
+    store.upsert_domain(args.fqdn)
+    store.commit()
+
+
+def cmd_add_service(store, args):
+    hid, _ = store.upsert_host(args.host)
+    store.upsert_service(hid, args.port, getattr(args, "name", "") or "")
+    store.commit()
+
+
+def cmd_add_user(store, args):
+    username, rtype, rid = resolve_identity(store, args)
+    store.upsert_identity(username, rtype, rid,
+                          uid=getattr(args, "uid", None),
+                          shell=getattr(args, "shell", None),
+                          description=getattr(args, "desc", None))
+    store.commit()
+
+
+def cmd_add_secret(store, args):
+    spec = secret_from_args(args)
+    if spec is None:
+        raise CmError("give the secret with --pass/--nt/--hash/--key/--pfx/--ticket")
+    sid, _ = store.upsert_secret(*spec)
+    if getattr(args, "src", None):
+        store.add_observation(args.src, secret_id=sid)
+    store.commit()
+
+
+def cmd_link(store, args):
+    username, rtype, rid = resolve_identity(store, args)
+    iid, _ = store.upsert_identity(username, rtype, rid)
+    if not args.secret:
+        raise CmError("link needs --secret <ref>")
+    sid = store.resolve_secret_ref(args.secret)["id"]
+    store.link_identity_secret(iid, sid, origin=getattr(args, "origin", "discovered") or "discovered")
+    store.commit()
+
+
+def cmd_access(store, args):
+    username, rtype, rid = resolve_identity(store, args)
+    iid, _ = store.upsert_identity(username, rtype, rid)
+    sid = pick_secret_for_identity(store, args, iid, "access")
+    store.link_identity_secret(iid, sid)
+    scope, hid, svid = resolve_target(store, args)
+    store.upsert_access(iid, sid, scope, hid, svid,
+                        protocol=(getattr(args, "proto", None) or ""),
+                        privilege=(getattr(args, "priv", None) or ""),
+                        status=(getattr(args, "status", None) or "untested"))
+    store.commit()
+
+
+def cmd_observe(store, args):
+    host_id = None
+    if getattr(args, "host", None):
+        host_id, _ = store.upsert_host(args.host)
+    iid = None
+    sid = None
+    if getattr(args, "user", None) or getattr(args, "null", False):
+        args.identity = getattr(args, "user", None)
+        username, rtype, rid = resolve_identity(store, args)
+        ident = store.find_identity(username, rtype, rid)
+        if not ident:
+            iid, _ = store.upsert_identity(username, rtype, rid)
+        else:
+            iid = ident["id"]
+    if getattr(args, "secret", None):
+        sid = store.resolve_secret_ref(args.secret)["id"]
+    if iid is None and sid is None:
+        raise CmError("observe needs --user and/or --secret")
+    store.add_observation(args.method or "", host_id=host_id, identity_id=iid, secret_id=sid)
+    store.commit()
+
+
+# --------------------------------------------------------------------------
+# imports
+# --------------------------------------------------------------------------
+
+def _read_lines(path):
+    try:
+        with open(path, "r", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError as e:
+        raise CmError("cannot read %s: %s" % (path, e))
+
+
+def cmd_import_passwd(store, args):
+    hid, _ = store.upsert_host(args.host, os_name="linux")
+    kept, skipped = 0, 0
+    skipped_names = []
+    store.echo_enabled = False
+    for line in _read_lines(args.file):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 7:
+            continue
+        name, _pw, uid, _gid, gecos, _home, shell = parts[:7]
+        if shell.strip() in NOLOGIN_SHELLS:
+            skipped += 1
+            skipped_names.append(name)
+            continue
+        try:
+            uid_i = int(uid)
+        except ValueError:
+            uid_i = None
+        iid, _ = store.upsert_identity(name, "host", hid, uid=uid_i, shell=shell,
+                                       description=gecos)
+        store.add_observation("passwd", host_id=hid, identity_id=iid)
+        kept += 1
+    store.commit()
+    store.echo_enabled = True
+    c = store.c
+    print("%s %d host user(s) on %s" % (c.bold("imported:"), kept, args.host))
+    if skipped:
+        print(c.dim("  skipped %d no-login account(s): %s" %
+                    (skipped, ", ".join(skipped_names[:12]) + (" ..." if skipped > 12 else ""))))
+
+
+def cmd_import_shadow(store, args):
+    hid, _ = store.upsert_host(args.host, os_name="linux")
+    attached, skipped = 0, 0
+    store.echo_enabled = False
+    for line in _read_lines(args.file):
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        name, h = parts[0], parts[1]
+        if not h or h[0] in "*!" or not h.startswith("$"):
+            skipped += 1
+            continue
+        stype = None
+        for prefix, t in SHADOW_PREFIXES:
+            if h.startswith(prefix):
+                stype = t
+                break
+        if stype is None:
+            stype = "other"
+        iid, _ = store.upsert_identity(name, "host", hid)
+        sid, _ = store.upsert_secret(stype, h)
+        store.link_identity_secret(iid, sid)
+        store.add_observation("shadow", host_id=hid, identity_id=iid, secret_id=sid)
+        attached += 1
+    store.commit()
+    store.echo_enabled = True
+    c = store.c
+    print("%s %d hash(es) attached on %s%s" %
+          (c.bold("imported:"), attached, args.host,
+           (c.dim("  (%d locked/absent skipped)" % skipped) if skipped else "")))
+
+
+def cmd_import_ldap(store, args):
+    import json
+    try:
+        with open(args.file, "r", errors="replace") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as e:
+        raise CmError("cannot parse %s as JSON: %s" % (args.file, e))
+    did, _ = store.upsert_domain(args.domain)
+    entries = data if isinstance(data, list) else data.get("entries", data.get("users", []))
+    count = 0
+    store.echo_enabled = False
+    for e in entries:
+        attrs = e.get("attributes", e) if isinstance(e, dict) else {}
+        sam = attrs.get("sAMAccountName") or attrs.get("samaccountname") or attrs.get("cn")
+        if isinstance(sam, list):
+            sam = sam[0] if sam else None
+        if not sam:
+            continue
+        desc = attrs.get("description")
+        if isinstance(desc, list):
+            desc = "; ".join(str(x) for x in desc)
+        iid, _ = store.upsert_identity(str(sam), "domain", did, description=desc or "")
+        store.add_observation("ldapdomaindump", identity_id=iid)
+        count += 1
+    store.commit()
+    store.echo_enabled = True
+    print("%s %d domain user(s) into %s" % (store.c.bold("imported:"), count, args.domain))
+
+
+def cmd_import_secretsdump(store, args):
+    """Parse impacket secretsdump / SAM / NTDS 'name:rid:lm:nt:::' lines."""
+    if args.domain:
+        realm = ("domain", args.domain)
+    elif args.host:
+        realm = ("host", args.host)
+    else:
+        raise CmError("secretsdump import needs --domain <fqdn> (NTDS) or --host <name> (SAM)")
+    rtype, rid = store.resolve_place(realm)
+    count = 0
+    store.echo_enabled = False
+    for line in _read_lines(args.file):
+        line = line.strip()
+        if not line or ":::" not in line:
+            continue
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        name, _rid, lm, nt = parts[0], parts[1], parts[2], parts[3]
+        if len(nt) != 32:
+            continue
+        # name may be DOMAIN\user
+        uname = name.split("\\")[-1]
+        iid, _ = store.upsert_identity(uname, rtype, rid)
+        sid, _ = store.upsert_secret("ntlm", nt.lower())
+        store.link_identity_secret(iid, sid)
+        src = "ntds-dump" if rtype == "domain" else "sam-dump"
+        store.add_observation(src, identity_id=iid, secret_id=sid)
+        count += 1
+    store.commit()
+    store.echo_enabled = True
+    print("%s %d NT hash(es)" % (store.c.bold("imported:"), count))
+
+
+def cmd_import_nxc(store, args):
+    """Parse NetExec/CrackMapExec console output lines with [+] successes."""
+    count = 0
+    store.echo_enabled = False
+    for line in _read_lines(args.file):
+        if "[+]" not in line:
+            continue
+        toks = line.split()
+        if len(toks) < 2:
+            continue
+        proto = toks[0].lower()
+        if proto not in PROTO_DEFAULTS:
+            proto = toks[0].lower()
+        # find the ip (second token) and hostname (token before [+] region if present)
+        ip = toks[1]
+        try:
+            plus = toks.index("[+]")
+        except ValueError:
+            continue
+        # nxc columns: PROTO IP PORT HOSTNAME [+] creds...  -> hostname at plus-1 (index 3)
+        hostname = toks[plus - 1] if plus - 1 >= 3 else None
+        cred = " ".join(toks[plus + 1:])
+        pwned = "(Pwn3d!)" in cred
+        cred = cred.replace("(Pwn3d!)", "").strip()
+        if ":" not in cred:
+            continue
+        userpart, _, secret = cred.partition(":")
+        secret = secret.strip()
+        if "\\" in userpart:
+            dom, user = userpart.split("\\", 1)
+        else:
+            dom, user = None, userpart
+        # local vs domain: if the "domain" equals the hostname, it's a local account
+        if dom and hostname and dom.lower() == hostname.lower():
+            rtype, rid = store.resolve_place(("host", ip))
+        elif dom:
+            rtype, rid = store.resolve_place(("domain", dom))
+        else:
+            rtype, rid = store.resolve_place(("host", ip))
+        iid, _ = store.upsert_identity(user, rtype, rid)
+        # secret: 32-hex (optionally lm:nt) -> ntlm, else plaintext
+        sval = secret
+        if ":" in secret and len(secret.split(":")[-1]) == 32:
+            sval = secret.split(":")[-1]
+            stype = "ntlm"
+        elif len(secret) == 32 and all(ch in "0123456789abcdefABCDEF" for ch in secret):
+            stype = "ntlm"
+            sval = secret.lower()
+        else:
+            stype = "plaintext"
+        sid, _ = store.upsert_secret(stype, sval)
+        store.link_identity_secret(iid, sid)
+        hid, _ = store.upsert_host(ip)
+        pdef = PROTO_DEFAULTS.get(proto, ("host", None))
+        if pdef[0] == "service" and pdef[1]:
+            svid, _ = store.upsert_service(hid, pdef[1], proto)
+            store.upsert_access(iid, sid, "service", None, svid, protocol=proto,
+                                privilege=("" ), status="valid")
+        else:
+            store.upsert_access(iid, sid, "host", hid, None, protocol=proto,
+                                privilege=("local_admin" if pwned else "user"), status="valid")
+        count += 1
+    store.commit()
+    store.echo_enabled = True
+    print("%s %d valid login(s) from nxc output" % (store.c.bold("imported:"), count))
+
+
+# --------------------------------------------------------------------------
+# queries & exports
+# --------------------------------------------------------------------------
+
+def cmd_users(store, args):
+    q = "SELECT * FROM identities"
+    where, params = [], []
+    if getattr(args, "domain", None):
+        where.append("realm_type='domain' AND realm_id=(SELECT id FROM domains WHERE fqdn=?)")
+        params.append(args.domain)
+    if getattr(args, "host", None):
+        where.append("realm_type='host' AND realm_id=(SELECT id FROM hosts WHERE name=?)")
+        params.append(args.host)
+    if getattr(args, "realm", None):
+        where.append("realm_type=?")
+        params.append(args.realm)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY realm_type, username"
+    rows = store.conn.execute(q, params).fetchall()
+    for r in rows:
+        print(store.identity_label_row(r))
+    if not rows:
+        print(store.c.dim("(no identities)"))
+
+
+def cmd_hashes(store, args):
+    stype = getattr(args, "type", None)
+    if stype and stype not in SECRET_TYPES:
+        raise CmError("unknown type %r" % stype)
+    q = "SELECT * FROM secrets WHERE 1=1"
+    params = []
+    if stype:
+        q += " AND type=?"
+        params.append(stype)
+    else:
+        q += " AND type IN (%s)" % ",".join("?" * len(CRACKABLE_TYPES))
+        params.extend(sorted(CRACKABLE_TYPES))
+    rows = store.conn.execute(q + " ORDER BY type, id", params).fetchall()
+    for r in rows:
+        if r["type"] in BLOB_TYPES:
+            continue
+        print("#%d\t%s\t%s" % (r["id"], r["type"], r["value"]))
+    if not rows:
+        print(store.c.dim("(no hashes)"))
+
+
+def _uncracked_rows(store):
+    return store.conn.execute(
+        "SELECT s.* FROM secrets s WHERE s.type IN (%s) "
+        "AND NOT EXISTS (SELECT 1 FROM secret_links sl WHERE sl.to_secret_id=s.id AND sl.relation='cracks') "
+        "AND NOT EXISTS (SELECT 1 FROM identity_secrets il WHERE il.secret_id=s.id AND il.superseded=0 "
+        "                HAVING 0) "
+        "ORDER BY s.type, s.id" % ",".join("?" * len(CRACKABLE_TYPES)),
+        sorted(CRACKABLE_TYPES)).fetchall()
+
+
+def cmd_todo_crack(store, args):
+    # crackable, not yet cracked, and still live (ownerless OR >=1 non-superseded link)
+    rows = store.conn.execute(
+        "SELECT s.* FROM secrets s "
+        "WHERE s.type IN (%s) "
+        "AND NOT EXISTS (SELECT 1 FROM secret_links sl "
+        "                WHERE sl.to_secret_id=s.id AND sl.relation='cracks') "
+        "AND ( (SELECT COUNT(*) FROM identity_secrets il WHERE il.secret_id=s.id)=0 "
+        "      OR EXISTS (SELECT 1 FROM identity_secrets il "
+        "                 WHERE il.secret_id=s.id AND il.superseded=0) ) "
+        "ORDER BY s.type, s.id" % ",".join("?" * len(CRACKABLE_TYPES)),
+        sorted(CRACKABLE_TYPES)).fetchall()
+    for r in rows:
+        print("#%d\t%s\t%s" % (r["id"], r["type"], r["value"]))
+    if not rows:
+        print(store.c.dim("(nothing left to crack)"))
+
+
+def cmd_where(store, args):
+    if getattr(args, "user", None) or getattr(args, "null", False):
+        args.identity = getattr(args, "user", None)
+        username, rtype, rid = resolve_identity(store, args)
+        ident = store.find_identity(username, rtype, rid)
+        if not ident:
+            raise CmError("no such identity")
+        rows = store.conn.execute(
+            "SELECT * FROM accesses WHERE identity_id=? ORDER BY status, scope", (ident["id"],)).fetchall()
+        print(store.c.bold("accesses for %s:" % store.identity_label_row(ident)))
+        _print_accesses(store, rows, show_user=False)
+    elif getattr(args, "host", None):
+        host, port = split_host_port(args.host)
+        hrow = store.conn.execute("SELECT * FROM hosts WHERE name=?", (host,)).fetchone()
+        if not hrow:
+            raise CmError("no such host: %s" % host)
+        rows = store.conn.execute(
+            "SELECT a.* FROM accesses a LEFT JOIN services s ON s.id=a.service_id "
+            "WHERE a.host_id=? OR s.host_id=? ORDER BY a.status", (hrow["id"], hrow["id"])).fetchall()
+        print(store.c.bold("accesses on %s:" % host))
+        _print_accesses(store, rows, show_user=True)
+    else:
+        raise CmError("use `cm where --user X` or `cm where --host Y`")
+
+
+def _print_accesses(store, rows, show_user):
+    if not rows:
+        print(store.c.dim("  (none)"))
+        return
+    for a in rows:
+        tgt = store._target_label(a["scope"], a["host_id"], a["service_id"])
+        proto = (a["protocol"] + "/") if a["protocol"] else ""
+        bits = []
+        if a["privilege"]:
+            bits.append(a["privilege"])
+        status = a["status"]
+        col = {"valid": store.c.green, "invalid": store.c.red,
+               "untested": store.c.yellow, "expired": store.c.dim}.get(status, store.c.dim)
+        head = store.identity_label_row(
+            store.conn.execute("SELECT * FROM identities WHERE id=?", (a["identity_id"],)).fetchone()) + "  " if show_user else ""
+        print("  %s%s%s  %s%s" % (head, proto, tgt, col(status),
+                                  ("  [" + ", ".join(bits) + "]") if bits else ""))
+
+
+def cmd_show(store, args):
+    if args.kind == "user":
+        args.identity = args.name
+        username, rtype, rid = resolve_identity(store, args)
+        ident = store.find_identity(username, rtype, rid)
+        if not ident:
+            raise CmError("no such identity: %s" % args.name)
+        _show_identity(store, ident)
+    elif args.kind == "secret":
+        row = store.resolve_secret_ref(args.name)
+        _show_secret(store, row)
+    else:
+        raise CmError("show user <ident> | show secret <ref>")
+
+
+def _show_identity(store, ident):
+    c = store.c
+    print(c.bold(store.identity_label_row(ident)))
+    if ident["description"]:
+        print("  description: " + ident["description"])
+    if ident["uid"] is not None or ident["shell"]:
+        print("  uid=%s shell=%s" % (ident["uid"], ident["shell"]))
+    secs = store.conn.execute(
+        "SELECT il.*, s.type AS stype, s.value AS sval, s.id AS sid FROM identity_secrets il "
+        "JOIN secrets s ON s.id=il.secret_id WHERE il.identity_id=? ORDER BY il.superseded",
+        (ident["id"],)).fetchall()
+    print("  secrets:")
+    if not secs:
+        print(c.dim("    (none)"))
+    for s in secs:
+        flags = []
+        if s["origin"] == "introduced":
+            flags.append("introduced")
+        if s["superseded"]:
+            flags.append(c.yellow("superseded"))
+        val = "(blob)" if s["stype"] in BLOB_TYPES else s["sval"]
+        print("    #%d %s %s%s" % (s["sid"], s["stype"], val,
+                                   ("  [" + ", ".join(flags) + "]") if flags else ""))
+    accs = store.conn.execute(
+        "SELECT * FROM accesses WHERE identity_id=? ORDER BY status", (ident["id"],)).fetchall()
+    print("  accesses:")
+    _print_accesses(store, accs, show_user=False) if accs else print(c.dim("    (none)"))
+    obs = store.conn.execute(
+        "SELECT * FROM observations WHERE identity_id=? ORDER BY found_at", (ident["id"],)).fetchall()
+    if obs:
+        print("  found via: " + ", ".join(o["method"] for o in obs if o["method"]))
+
+
+def _show_secret(store, row):
+    c = store.c
+    val = "(blob: %s)" % (row["filename"] or "file") if row["type"] in BLOB_TYPES else row["value"]
+    print(c.bold("#%d %s" % (row["id"], row["type"])) + "  " + val)
+    if row["expires_at"]:
+        print("  expires: " + row["expires_at"])
+    owners = store.conn.execute(
+        "SELECT i.*, il.origin, il.superseded FROM identity_secrets il "
+        "JOIN identities i ON i.id=il.identity_id WHERE il.secret_id=?", (row["id"],)).fetchall()
+    if owners:
+        print("  owners:")
+        for o in owners:
+            flags = []
+            if o["origin"] == "introduced":
+                flags.append("introduced")
+            if o["superseded"]:
+                flags.append("superseded")
+            print("    %s%s" % (store.identity_label_row(o),
+                                ("  [" + ", ".join(flags) + "]") if flags else ""))
+    links = store.conn.execute(
+        "SELECT sl.relation, s.id AS sid, s.type AS st, s.value AS sv FROM secret_links sl "
+        "JOIN secrets s ON s.id=sl.from_secret_id WHERE sl.to_secret_id=?", (row["id"],)).fetchall()
+    for l in links:
+        print("  %s by #%d %s %s" % (l["relation"], l["sid"], l["st"], mask(l["sv"])))
+
+
+def cmd_stats(store, args):
+    c = store.c
+    def one(q, p=()):
+        return store.conn.execute(q, p).fetchone()[0]
+    print(c.bold("engagement: ") + store.path)
+    print("  hosts        %d" % one("SELECT COUNT(*) FROM hosts"))
+    print("  domains      %d" % one("SELECT COUNT(*) FROM domains"))
+    print("  services     %d" % one("SELECT COUNT(*) FROM services"))
+    print("  identities   %d" % one("SELECT COUNT(*) FROM identities"))
+    print("  secrets      %d" % one("SELECT COUNT(*) FROM secrets"))
+    for t, n in store.conn.execute(
+            "SELECT type, COUNT(*) FROM secrets GROUP BY type ORDER BY type"):
+        print("      %-16s %d" % (t, n))
+    print("  accesses     %d" % one("SELECT COUNT(*) FROM accesses"))
+    for s, n in store.conn.execute(
+            "SELECT status, COUNT(*) FROM accesses GROUP BY status ORDER BY status"):
+        print("      %-16s %d" % (s, n))
+
+
+def cmd_export(store, args):
+    what = args.what
+    if what == "users":
+        rows = _export_user_rows(store, args)
+        out = sorted(set(r["username"] for r in rows if r["username"] != ""))
+        print("\n".join(out))
+    elif what == "passwords":
+        rows = store.conn.execute(
+            "SELECT DISTINCT value FROM secrets WHERE type='plaintext'").fetchall()
+        print("\n".join(sorted(set(r["value"] for r in rows))))
+    elif what == "pairs":
+        stype = getattr(args, "type", None) or "plaintext"
+        if stype not in SECRET_TYPES:
+            raise CmError("unknown type %r" % stype)
+        q = ("SELECT i.username AS u, s.value AS v FROM identity_secrets il "
+             "JOIN identities i ON i.id=il.identity_id "
+             "JOIN secrets s ON s.id=il.secret_id WHERE s.type=?")
+        params = [stype]
+        if getattr(args, "introduced", False):
+            q += " AND il.origin='introduced'"
+        if not getattr(args, "all", False):
+            q += " AND il.superseded=0"
+        rows = store.conn.execute(q, params).fetchall()
+        out = sorted(set("%s:%s" % (r["u"], r["v"]) for r in rows))
+        print("\n".join(out))
+    elif what == "hashes":
+        stype = getattr(args, "type", None)
+        if not stype:
+            raise CmError("export hashes needs --type TYPE")
+        if stype not in SECRET_TYPES:
+            raise CmError("unknown type %r" % stype)
+        rows = store.conn.execute(
+            "SELECT DISTINCT value FROM secrets WHERE type=?", (stype,)).fetchall()
+        print("\n".join(r["value"] for r in rows))
+    elif what == "key":
+        if not args.ref:
+            raise CmError("export key needs a secret ref (e.g. #5)")
+        row = store.resolve_secret_ref(args.ref)
+        if row["type"] not in BLOB_TYPES:
+            raise CmError("#%d is not a key/pfx/ticket blob" % row["id"])
+        sys.stdout.buffer.write(base64.b64decode(row["value"]))
+    else:
+        raise CmError("export users|passwords|pairs|hashes|key")
+
+
+def _export_user_rows(store, args):
+    q = "SELECT * FROM identities"
+    where, params = [], []
+    if getattr(args, "domain", None):
+        where.append("realm_type='domain' AND realm_id=(SELECT id FROM domains WHERE fqdn=?)")
+        params.append(args.domain)
+    if getattr(args, "host", None):
+        where.append("realm_type='host' AND realm_id=(SELECT id FROM hosts WHERE name=?)")
+        params.append(args.host)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    return store.conn.execute(q, params).fetchall()
+
+
+def cmd_init(store, args):
+    if store._was_new:
+        print(store.c.green("initialised new engagement db: ") + store.path)
+    else:
+        print(store.c.dim("engagement db already exists (schema ensured): ") + store.path)
+
+
+# --------------------------------------------------------------------------
+# argument parser
+# --------------------------------------------------------------------------
+
+def add_secret_flags(p):
+    g = p.add_argument_group("secret (choose one)")
+    g.add_argument("--pass", dest="password", help="plaintext password")
+    g.add_argument("--nt", help="NTLM hash")
+    g.add_argument("--hash", help="TYPE:VALUE, e.g. kerberos_tgs:'$krb5tgs$...'")
+    g.add_argument("--key", help="path to an SSH private key file")
+    g.add_argument("--pfx", help="path to a certificate/PFX file")
+    g.add_argument("--ticket", help="path to a Kerberos ticket (.ccache/.kirbi)")
+    g.add_argument("--expires", help="ticket expiry (free text), e.g. '2026-10-08 18:00'")
+    g.add_argument("--label", help="label for a 'hash:other:' or custom secret")
+
+
+def add_identity_flags(p):
+    p.add_argument("--realm", help="override realm: domain:FQDN | host:NAME | service:HOST:PORT")
+    p.add_argument("--null", action="store_true", help="the empty-string principal (SMB null session)")
+
+
+def add_target_flags(p):
+    p.add_argument("--at", help="target HOST or HOST:PORT")
+    p.add_argument("--proto", help="protocol (smb, ssh, winrm, http, mysql, mssql, ...)")
+    p.add_argument("--priv", help="privilege (host: user/local_admin/domain_admin/root; service: free text)")
+    p.add_argument("--scope", choices=SCOPES, help="force host or service scope")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="cm", description="credential manager for pentest/CTF engagements",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  cm init corp.db\n"
+               "  cm cred 'CORP\\jsmith' --nt 00112233... --src responder-mitm@10.0.0.50\n"
+               "  cm works 'CORP\\jsmith' --at HOST1,HOST2 --proto smb --priv user\n"
+               "  cm cracked --from hashcat.potfile\n"
+               "  cm export pairs --type ntlm > userhash.txt\n")
+    p.add_argument("--db", help="engagement database (env CM_DB, default ./engagement.db)")
+    p.add_argument("-q", "--quiet", action="store_true", help="suppress the teaching echo lines")
+    p.add_argument("--version", action="version", version="cm " + VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # init
+    sp = sub.add_parser("init", help="create / ensure an engagement db")
+    sp.add_argument("path", nargs="?", help="db path (overrides --db / default)")
+    sp.set_defaults(func=cmd_init)
+
+    # cred (macro)
+    sp = sub.add_parser("cred", help="record a credential (upserts identity+secret+link, optional target)")
+    sp.add_argument("identity", nargs="?", help="DOMAIN\\user | user@host | user@host:port")
+    add_identity_flags(sp)
+    add_secret_flags(sp)
+    add_target_flags(sp)
+    sp.add_argument("--status", choices=STATUSES, help="access status (default untested when --at given)")
+    sp.add_argument("--origin", choices=ORIGINS, help="credential origin (default discovered)")
+    sp.add_argument("--src", help="provenance note, e.g. 'web.config on HOST5'")
+    sp.add_argument("--desc", help="identity description")
+    sp.add_argument("--uid", type=int, help="linux uid")
+    sp.add_argument("--shell", help="linux shell")
+    sp.set_defaults(func=cmd_cred)
+
+    # works / fail (macro)
+    for name, fn, helptext in (("works", cmd_works, "confirm a working login (status=valid)"),
+                               ("fail", cmd_fail, "record a failed login (status=invalid)")):
+        sp = sub.add_parser(name, help=helptext)
+        sp.add_argument("identity", nargs="?")
+        add_identity_flags(sp)
+        add_secret_flags(sp)
+        sp.add_argument("--secret", help="existing secret ref (#id, type:value, or value prefix)")
+        add_target_flags(sp)
+        sp.add_argument("--src", help="provenance note")
+        sp.set_defaults(func=fn)
+
+    # reset (macro)
+    sp = sub.add_parser("reset", help="tester-changed password: supersede old + add introduced")
+    sp.add_argument("identity", nargs="?")
+    add_identity_flags(sp)
+    add_secret_flags(sp)
+    sp.add_argument("--src", help="provenance note")
+    sp.set_defaults(func=cmd_reset)
+
+    # supersede (atomic)
+    sp = sub.add_parser("supersede", help="mark an identity's secret stale")
+    sp.add_argument("identity", nargs="?")
+    add_identity_flags(sp)
+    sp.add_argument("--secret", help="which secret (ref); inferred if the identity has one live")
+    sp.set_defaults(func=cmd_supersede)
+
+    # cracked (macro)
+    sp = sub.add_parser("cracked", help="record that a hash was cracked to a plaintext")
+    sp.add_argument("ref", nargs="?", help="hash ref (#id, type:value, or value prefix)")
+    sp.add_argument("--pass", "--plaintext", dest="plaintext", help="the cracked plaintext")
+    sp.add_argument("--from", dest="from_file", help="hashcat potfile / 'hash:plain' file")
+    sp.add_argument("--stdin", action="store_true", help="read 'hash:plain' lines from stdin")
+    sp.set_defaults(func=cmd_cracked)
+
+    # unlock (atomic-ish)
+    sp = sub.add_parser("unlock", help="link a passphrase to a key/pfx (unlocks)")
+    sp.add_argument("--key", help="ssh key secret ref")
+    sp.add_argument("--pfx", help="pfx secret ref")
+    sp.add_argument("--secret", help="protected secret ref")
+    sp.add_argument("--passphrase", help="the passphrase plaintext")
+    sp.add_argument("--with", dest="with_secret", help="use an existing plaintext secret ref")
+    sp.set_defaults(func=cmd_unlock)
+
+    # add (atomic group)
+    sp = sub.add_parser("add", help="atomic adders")
+    asub = sp.add_subparsers(dest="addkind", required=True)
+    a = asub.add_parser("host"); a.add_argument("name"); a.add_argument("--os")
+    a.set_defaults(func=cmd_add_host)
+    a = asub.add_parser("domain"); a.add_argument("fqdn"); a.set_defaults(func=cmd_add_domain)
+    a = asub.add_parser("service"); a.add_argument("--host", required=True)
+    a.add_argument("--port", type=int, required=True); a.add_argument("--name", default="")
+    a.set_defaults(func=cmd_add_service)
+    a = asub.add_parser("user"); a.add_argument("identity", nargs="?")
+    add_identity_flags(a); a.add_argument("--desc"); a.add_argument("--uid", type=int)
+    a.add_argument("--shell"); a.set_defaults(func=cmd_add_user)
+    a = asub.add_parser("secret"); add_secret_flags(a); a.add_argument("--src")
+    a.set_defaults(func=cmd_add_secret)
+
+    # link (atomic)
+    sp = sub.add_parser("link", help="link a secret to an identity")
+    sp.add_argument("identity", nargs="?")
+    add_identity_flags(sp)
+    sp.add_argument("--secret", required=True)
+    sp.add_argument("--origin", choices=ORIGINS)
+    sp.set_defaults(func=cmd_link)
+
+    # access (atomic)
+    sp = sub.add_parser("access", help="record an access row directly")
+    sp.add_argument("identity", nargs="?")
+    add_identity_flags(sp)
+    add_secret_flags(sp)
+    sp.add_argument("--secret")
+    add_target_flags(sp)
+    sp.add_argument("--status", choices=STATUSES)
+    sp.set_defaults(func=cmd_access)
+
+    # observe (atomic)
+    sp = sub.add_parser("observe", help="add a provenance observation")
+    sp.add_argument("--user", help="identity token")
+    sp.add_argument("--null", action="store_true")
+    sp.add_argument("--realm")
+    sp.add_argument("--secret", help="secret ref")
+    sp.add_argument("--method", default="", help="how/where found")
+    sp.add_argument("--host", help="host where found")
+    sp.set_defaults(func=cmd_observe)
+
+    # import
+    sp = sub.add_parser("import", help="bulk import from tool output")
+    isub = sp.add_subparsers(dest="impkind", required=True)
+    i = isub.add_parser("passwd"); i.add_argument("--host", required=True); i.add_argument("file")
+    i.set_defaults(func=cmd_import_passwd)
+    i = isub.add_parser("shadow"); i.add_argument("--host", required=True); i.add_argument("file")
+    i.set_defaults(func=cmd_import_shadow)
+    i = isub.add_parser("ldapdomaindump"); i.add_argument("--domain", required=True); i.add_argument("file")
+    i.set_defaults(func=cmd_import_ldap)
+    i = isub.add_parser("secretsdump"); i.add_argument("--domain"); i.add_argument("--host")
+    i.add_argument("file"); i.set_defaults(func=cmd_import_secretsdump)
+    i = isub.add_parser("nxc"); i.add_argument("file"); i.set_defaults(func=cmd_import_nxc)
+
+    # queries
+    sp = sub.add_parser("users", help="list identities")
+    sp.add_argument("--domain"); sp.add_argument("--host"); sp.add_argument("--realm", choices=REALM_TYPES)
+    sp.set_defaults(func=cmd_users)
+
+    sp = sub.add_parser("hashes", help="list stored hashes (optionally --type)")
+    sp.add_argument("--type")
+    sp.set_defaults(func=cmd_hashes)
+
+    sp = sub.add_parser("todo-crack", help="crackable hashes not yet cracked and still live")
+    sp.set_defaults(func=cmd_todo_crack)
+
+    sp = sub.add_parser("where", help="where a cred works / who works on a host")
+    sp.add_argument("--user"); sp.add_argument("--null", action="store_true"); sp.add_argument("--realm")
+    sp.add_argument("--host")
+    sp.set_defaults(func=cmd_where)
+
+    sp = sub.add_parser("show", help="show a user or secret in detail")
+    sp.add_argument("kind", choices=["user", "secret"])
+    sp.add_argument("name")
+    add_identity_flags(sp)
+    sp.set_defaults(func=cmd_show)
+
+    sp = sub.add_parser("stats", help="engagement summary counts")
+    sp.set_defaults(func=cmd_stats)
+
+    # export
+    sp = sub.add_parser("export", help="emit users/passwords/pairs/hashes/key for other tools")
+    sp.add_argument("what", choices=["users", "passwords", "pairs", "hashes", "key"])
+    sp.add_argument("ref", nargs="?", help="secret ref (for `export key`)")
+    sp.add_argument("--type", help="secret type (for pairs/hashes)")
+    sp.add_argument("--domain"); sp.add_argument("--host")
+    sp.add_argument("--introduced", action="store_true", help="only tester-introduced creds (pairs)")
+    sp.add_argument("--all", action="store_true", help="include superseded links (pairs)")
+    sp.set_defaults(func=cmd_export)
+
+    return p
+
+
+def resolve_db_path(args):
+    if getattr(args, "cmd", None) == "init" and getattr(args, "path", None):
+        return args.path
+    if args.db:
+        return args.db
+    env = os.environ.get("CM_DB")
+    if env:
+        return env
+    return "engagement.db"
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    color = C(_use_color())
+    db_path = resolve_db_path(args)
+    store = Store(db_path, color, echo=not args.quiet)
+    try:
+        args.func(store, args)
+    except CmError as e:
+        print(color.red("error: ") + str(e), file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        return 0
+    finally:
+        try:
+            store.conn.close()
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

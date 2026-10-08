@@ -1,0 +1,5 @@
+[
+  {"attributes": {"sAMAccountName": ["jsmith"], "description": ["Helpdesk operator - temp pw Welcome1?"], "memberOf": ["CN=Helpdesk,OU=Groups,DC=corp,DC=local"]}},
+  {"attributes": {"sAMAccountName": ["svc_sql"], "description": ["SQL service account. SPN MSSQLSvc/sql01"]}},
+  {"attributes": {"sAMAccountName": ["abROGERS"], "description": []}}
+]

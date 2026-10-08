@@ -1,0 +1,6 @@
+SMB         10.10.10.5      445    DC01             [*] Windows Server 2019 Build 17763 x64 (name:DC01) (domain:CORP.LOCAL)
+SMB         10.10.10.5      445    DC01             [+] CORP.LOCAL\jsmith:Autumn2024!
+SMB         10.10.10.20     445    WS01             [+] CORP.LOCAL\jsmith:Autumn2024!
+SMB         10.10.10.21     445    FILE01           [+] CORP.LOCAL\admin:Summer2024! (Pwn3d!)
+SMB         10.10.10.22     445    WS02             [+] WS02\Administrator:31d6cfe0d16ae931b73c59d7e0c089c0 (Pwn3d!)
+SMB         10.10.10.23     445    WS03             [-] CORP.LOCAL\bob:WrongPass STATUS_LOGON_FAILURE

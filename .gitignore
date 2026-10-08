@@ -1,0 +1,13 @@
+# engagement databases are loot - never commit them
+*.db
+*.sqlite
+*.sqlite3
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+
+# editor / os
+*.swp
+.DS_Store
