@@ -22,7 +22,12 @@ Two command tiers:
                        learn the model).
   * atomic commands  : add / link / access / supersede / observe / unlock.
 
-Run `cm --help` or `cm <command> --help`.
+`cm cred` takes EITHER a flat `user:x pass:y realm:z` line (order-free, like
+Metasploit `creds add`) OR the `IDENT --flags` grammar - the flat keys are just
+the matching flags without the dashes, so both do exactly the same thing.
+
+Run `cm` (no args) or `cm --help` for the cheat-sheet, `cm <command> --help`
+for one command.
 """
 
 import argparse
@@ -56,6 +61,37 @@ CRACKABLE_TYPES = {
     "kerberos_tgs", "kerberos_asrep", "dcc2",
     "sha512crypt", "sha256crypt", "md5crypt", "bcrypt", "yescrypt", "other",
 }
+
+# type -> (hashcat -m mode, john --format). Shown as a hint when you list/export
+# hashes, so you know the exact offline-cracking command without looking it up.
+CRACK_MODES = {
+    "ntlm": ("1000", "nt"), "lm": ("3000", "lm"),
+    "netntlmv1": ("5500", "netntlm"), "netntlmv2": ("5600", "netntlmv2"),
+    "kerberos_tgs": ("13100", "krb5tgs"), "kerberos_asrep": ("18200", "krb5asrep"),
+    "dcc2": ("2100", "mscash2"),
+    "sha512crypt": ("1800", "sha512crypt"), "sha256crypt": ("7400", "sha256crypt"),
+    "md5crypt": ("500", "md5crypt"), "bcrypt": ("3200", "bcrypt"),
+    "yescrypt": (None, "crypt"),
+}
+
+
+def crack_hint(stype):
+    """One-line 'how to crack this type' hint, or '' if unknown."""
+    hm = CRACK_MODES.get(stype)
+    if not hm:
+        return ""
+    mode, jformat = hm
+    hc = "hashcat -m %s" % mode if mode else "hashcat: n/a"
+    return "%s | john --format=%s" % (hc, jformat)
+
+
+def emit_crack_hints(types):
+    """Print 'how to crack this' hints (hashcat -m / john --format) to STDERR,
+    one per distinct type, so stdout stays clean for `> hashes.txt` piping."""
+    for t in sorted(set(types)):
+        h = crack_hint(t)
+        if h:
+            sys.stderr.write("# %-14s %s\n" % (t, h))
 
 REALM_TYPES = ("domain", "host", "service", "unknown")
 ORIGINS = ("discovered", "introduced")
@@ -850,7 +886,62 @@ def pick_secret_for_identity(store, args, identity_id, action):
 # macro commands
 # --------------------------------------------------------------------------
 
+# flat `key:value` tokens accepted by `cred`. One keyword per field, no synonyms;
+# each is just the matching `--flag` without the dashes (so `--nt HASH` <-> `nt:HASH`),
+# plus the `realm:`/`host:`/`service:` shortcuts that stand in for `--realm`.
+FLAT_KEYS = {"user", "pass", "nt", "hash", "key", "pfx", "ticket", "realm",
+             "host", "service", "at", "proto", "priv", "status", "src", "desc",
+             "expires", "label", "origin"}
+
+
+def _apply_flat_cred(args):
+    """Map flat `user:x pass:y realm:z` tokens onto the normal cred args.
+
+    Pure front-end sugar: a flat invocation is rewritten into the same
+    args (identity/realm/password/...) the classic `IDENT --flags` form uses, so
+    one code path does the work. A single bare token is treated as the identity
+    grammar (back-compat); anything with a known `key:` prefix is flat.
+    """
+    toks = getattr(args, "tokens", None) or []
+    is_flat = any(":" in t and t.split(":", 1)[0] in FLAT_KEYS for t in toks)
+    if not is_flat:
+        if len(toks) > 1:
+            raise CmError("too many arguments - give one IDENT, or flat key:value tokens")
+        args.identity = toks[0] if toks else None
+        return
+    user = realm = host = service = None
+    for t in toks:
+        k, _, v = t.partition(":")
+        if not _ or k not in FLAT_KEYS:
+            raise CmError("unknown token %r (expected user:/pass:/nt:/realm:/host:/at: ...)" % t)
+        if k == "user":
+            user = v
+        elif k == "pass":
+            args.password = v
+        elif k == "realm":
+            realm = v
+        elif k == "host":
+            host = v
+        elif k == "service":
+            service = v
+        else:
+            setattr(args, k, v)   # nt/hash/key/pfx/ticket/at/proto/priv/status/src/desc/expires/label/origin
+            # (each key equals its --flag's attribute name, so this just fills args)
+    if sum(x is not None for x in (realm, host, service)) > 1:
+        raise CmError("give only one of realm:/host:/service:")
+    if realm is not None:
+        args.realm = "domain:" + realm
+    elif host is not None:
+        args.realm = "host:" + host
+    elif service is not None:
+        args.realm = "service:" + service
+    if not user and not getattr(args, "null", False):
+        raise CmError("flat add needs user:<name> (or --null)")
+    args.identity = user
+
+
 def cmd_cred(store, args):
+    _apply_flat_cred(args)
     username, rtype, rid = resolve_identity(store, args)
     spec = secret_from_args(args)
     if spec is None:
@@ -1508,12 +1599,16 @@ def cmd_hashes(store, args):
         q += " AND type IN (%s)" % ",".join("?" * len(CRACKABLE_TYPES))
         params.extend(sorted(CRACKABLE_TYPES))
     rows = store.conn.execute(q + " ORDER BY type, id", params).fetchall()
+    shown = []
     for r in rows:
         if r["type"] in BLOB_TYPES:
             continue
         print("#%d\t%s\t%s" % (r["id"], r["type"], r["value"]))
-    if not rows:
+        shown.append(r["type"])
+    if not shown:
         print(store.c.dim("(no hashes)"))
+        return
+    emit_crack_hints(shown)
 
 
 def cmd_todo_crack(store, args):
@@ -1528,10 +1623,14 @@ def cmd_todo_crack(store, args):
         "                 WHERE il.secret_id=s.id AND il.superseded=0) ) "
         "ORDER BY s.type, s.id" % ",".join("?" * len(CRACKABLE_TYPES)),
         sorted(CRACKABLE_TYPES)).fetchall()
+    shown = []
     for r in rows:
         print("#%d\t%s\t%s" % (r["id"], r["type"], r["value"]))
+        shown.append(r["type"])
     if not rows:
         print(store.c.dim("(nothing left to crack)"))
+        return
+    emit_crack_hints(shown)
 
 
 def cmd_where(store, args):
@@ -1808,6 +1907,8 @@ def cmd_export(store, args):
         rows = store.conn.execute(
             "SELECT DISTINCT value FROM secrets WHERE type=?", (stype,)).fetchall()
         print("\n".join(r["value"] for r in rows))
+        if rows:
+            emit_crack_hints([stype])
     elif what == "key":
         if not args.ref:
             raise CmError("export key needs a secret ref (e.g. #5)")
@@ -1876,18 +1977,26 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="cm", description="credential manager for pentest/CTF engagements",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="see what's in the db:\n"
-               "  cm ls                     # overview: every identity, its secrets and where it works\n"
-               "  cm stats                  # just the counts\n"
-               "  cm show user 'CORP\\jsmith'  # one identity in full\n"
-               "  cm where --valid          # every confirmed login\n"
-               "  cm todo-crack             # hashes still to crack\n"
-               "\nrecord as you go:\n"
-               "  cm cred 'CORP\\jsmith' --nt 00112233... --src responder-mitm@10.0.0.50\n"
-               "  cm works 'CORP\\jsmith' --at HOST1,HOST2 --proto smb --priv user\n"
-               "  cm cracked --from hashcat.potfile\n"
-               "  cm export pairs --type ntlm > userhash.txt\n"
-               "\nlocal (standalone/workgroup) account -> use user@host, not COMPUTER\\user\n")
+        epilog="add a credential (these two forms are equivalent - use whichever reads better):\n"
+               "  cm cred user:jsmith pass:Summer2024 realm:CORP     # flat key:value, order-free\n"
+               "  cm cred 'CORP\\jsmith' --nt 00112233...  --src responder@10.0.0.50\n"
+               "  cm cred user:admin host:10.0.0.5 pass:root         # a LOCAL account on a host\n"
+               "  cm cred --null at:10.0.0.5 proto:smb               # SMB null session\n"
+               "  (flat keys: user: pass: nt: hash: key: pfx: ticket: realm:|host:|service: "
+               "at: proto: priv: status: src:)\n"
+               "\nsee what's in the db:\n"
+               "  cm ls                      # overview: every identity, its secrets, where it works\n"
+               "  cm where --valid           # every confirmed login\n"
+               "  cm show user 'CORP\\jsmith' # one identity in full\n"
+               "  cm todo-crack              # hashes still to crack (prints the crack command too)\n"
+               "\noffline cracking:\n"
+               "  cm export hashes --type ntlm > ntlm.txt   # hashcat -m / john --format printed to stderr\n"
+               "  cm cracked --from hashcat.potfile         # feed the cracked potfile back in\n"
+               "\nonline attacks (spray / reuse / pass-the-hash):\n"
+               "  cm export users     > users.txt    # then: nxc smb H -u users.txt -p passwords.txt\n"
+               "  cm export passwords > pass.txt     # only plaintexts actually found in the env\n"
+               "  cm export pairs --type ntlm        # user:hash lines for pass-the-hash\n"
+               "\nlocal (standalone/workgroup) account -> use user@host (or host:), not COMPUTER\\user\n")
     p.add_argument("--db", help="engagement database (env CM_DB, default ./engagement.db)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress the teaching echo lines")
     p.add_argument("--version", action="version", version="cm " + VERSION)
@@ -1900,7 +2009,9 @@ def build_parser():
 
     # cred (macro)
     sp = sub.add_parser("cred", help="record a credential (upserts identity+secret+link, optional target)")
-    sp.add_argument("identity", nargs="?", help="DOMAIN\\user | user@host | user@host:port")
+    sp.add_argument("tokens", nargs="*",
+                    help="flat: user:NAME pass:… nt:… realm:… at:… -- or one IDENT "
+                         "(DOMAIN\\user | user@host | user@host:port)")
     add_identity_flags(sp)
     add_secret_flags(sp)
     add_target_flags(sp)
@@ -2027,11 +2138,12 @@ def build_parser():
     sp.add_argument("--domain"); sp.add_argument("--host"); sp.add_argument("--realm", choices=REALM_TYPES)
     sp.set_defaults(func=cmd_users)
 
-    sp = sub.add_parser("hashes", help="list stored hashes (optionally --type)")
+    sp = sub.add_parser("hashes", help="list stored hashes (--type T); crack hints go to stderr")
     sp.add_argument("--type")
     sp.set_defaults(func=cmd_hashes)
 
-    sp = sub.add_parser("todo-crack", help="crackable hashes not yet cracked and still live")
+    sp = sub.add_parser("todo-crack",
+                        help="crackable hashes not yet cracked and still live (+ crack command)")
     sp.set_defaults(func=cmd_todo_crack)
 
     sp = sub.add_parser("where", help="where a cred works / who works on a host / all accesses")
@@ -2083,6 +2195,9 @@ def resolve_db_path(args):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
+    if not argv:
+        parser.print_help()
+        return 0
     args = parser.parse_args(argv)
     color = C(_use_color())
     db_path = resolve_db_path(args)

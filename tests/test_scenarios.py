@@ -43,6 +43,15 @@ class Ctx:
                 " ".join(args), proc.stderr, proc.stdout)
         return proc.stdout + proc.stderr
 
+    def run2(self, *args, **kw):
+        """Like run(), but returns (stdout, stderr) separately so a test can
+        assert that a hint lands on stderr and stdout stays pipe-clean."""
+        env = dict(os.environ, NO_COLOR="1", CM_DB=self.db)
+        proc = subprocess.run([sys.executable, CM, *args],
+                              capture_output=True, text=True, env=env, cwd=self.workdir)
+        assert proc.returncode == 0, "command failed: cm %s\nSTDERR: %s" % (" ".join(args), proc.stderr)
+        return proc.stdout, proc.stderr
+
     def q1(self, sql, params=()):
         con = sqlite3.connect(self.db)
         try:
@@ -541,6 +550,59 @@ def invariant_superseded_reconcile(cx):
     assert "zz:LiveReuse" in out, "a live hash yielding the plaintext must keep the pair live:\n" + out
 
 
+def invariant_flat_add_equivalence(cx):
+    # flat `user:x pass:y realm:Z` must land the same rows as `IDENT --flags`.
+    cx.run("cred", "user:flatjoe", "pass:FlatPw1", "realm:CORP")   # flat form
+    cx.run("cred", "CORP\\gramjoe", "--pass", "FlatPw1")           # grammar form
+    assert cx.q1("SELECT realm_type FROM identities WHERE username='flatjoe'") == "domain"
+    assert cx.q1("SELECT realm_type FROM identities WHERE username='gramjoe'") == "domain"
+    # the shared plaintext dedupes to ONE secret owned by both principals
+    assert cx.q1("SELECT COUNT(*) FROM secrets WHERE value='FlatPw1'") == 1
+    sid = cx.q1("SELECT id FROM secrets WHERE value='FlatPw1'")
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets WHERE secret_id=?", (sid,)) == 2
+
+
+def invariant_flat_add_variants(cx):
+    # host: shortcut -> local account; at:/proto:/priv:/status: -> access;
+    # nt: -> ntlm hash; --null works with flat tokens; the error paths are clean.
+    cx.run("cred", "user:ladmin", "host:10.0.0.177", "pass:Local1",
+           "at:10.0.0.177", "proto:smb", "priv:local_admin", "status:valid")
+    hid = cx.q1("SELECT id FROM hosts WHERE name='10.0.0.177'")
+    assert cx.q1("SELECT realm_type FROM identities WHERE username='ladmin'") == "host"
+    assert cx.q1("SELECT realm_id FROM identities WHERE username='ladmin'") == hid
+    acc = cx.qall("SELECT a.* FROM accesses a JOIN identities i ON i.id=a.identity_id "
+                  "WHERE i.username='ladmin'")[0]
+    assert acc["scope"] == "host" and acc["status"] == "valid" and acc["privilege"] == "local_admin"
+    # nt: fills the --nt flag -> an ntlm secret (regression: must not be silently dropped)
+    cx.run("cred", "user:svcflat", "nt:31d6cfe0d16ae931b73c59d7e0c089c0", "realm:CORP")
+    assert cx.q1("SELECT s.type FROM secrets s JOIN identity_secrets il ON il.secret_id=s.id "
+                 "JOIN identities i ON i.id=il.identity_id WHERE i.username='svcflat'") == "ntlm"
+    # --null flag coexists with flat tokens (no user: needed)
+    cx.run("cred", "--null", "pass:", "host:10.0.0.178")
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='' AND realm_type='host' "
+                 "AND realm_id=(SELECT id FROM hosts WHERE name='10.0.0.178')") == 1
+    # clean errors
+    assert "only one of" in cx.run("cred", "user:x", "realm:A", "host:B", "pass:p", expect_fail=True)
+    assert "needs user" in cx.run("cred", "pass:p", "realm:A", expect_fail=True)
+    assert "unknown token" in cx.run("cred", "user:x", "password:p", expect_fail=True)
+    assert "too many" in cx.run("cred", "foo", "bar", expect_fail=True)
+
+
+def invariant_crack_hints(cx):
+    # hashes/todo-crack/export hashes emit the exact hashcat -m / john --format
+    # command, and that hint goes to STDERR so stdout stays clean for piping.
+    cx.run("cred", "CORP\\hinted", "--nt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    out, err = cx.run2("hashes", "--type", "ntlm")
+    assert "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" in out, "the hash belongs on stdout"
+    assert "hashcat -m 1000" in err and "john --format=nt" in err, "hint on stderr: %r" % err
+    assert "hashcat" not in out, "the hint must NOT pollute stdout (it would break a wordlist)"
+    # export hashes: file content clean, hint on stderr
+    eout, eerr = cx.run2("export", "hashes", "--type", "ntlm")
+    assert "hashcat" not in eout and "hashcat -m 1000" in eerr
+    # todo-crack also shows it
+    assert "hashcat -m 1000" in cx.run("todo-crack")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -577,6 +639,9 @@ def main():
         ("INV samdump import (noise ignored, shared-hash dedupe)", invariant_samdump_import),
         ("INV importers print their format when run with no file", invariant_import_format_help),
         ("INV superseded reconciles when a live hash yields it", invariant_superseded_reconcile),
+        ("INV flat add == grammar add (same rows)", invariant_flat_add_equivalence),
+        ("INV flat add variants (host:/nt:/at:/--null/errors)", invariant_flat_add_variants),
+        ("INV crack hints print to stderr, not stdout", invariant_crack_hints),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:

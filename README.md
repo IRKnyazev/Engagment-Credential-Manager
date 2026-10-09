@@ -98,10 +98,21 @@ red = `invalid`, dim = `expired`/superseded.
 ## 2. Recording things as you find them
 
 **Everyday macros** auto-create hosts/services/identities/secrets as you
-reference them, and echo the atomic steps they ran so you can see what happened:
+reference them, and echo the atomic steps they ran so you can see what happened.
+
+`cm cred` takes **either** a flat `key:value` line (order-free, like Metasploit
+`creds add`) **or** the `IDENT --flags` grammar — pick whichever reads better,
+they do the exact same thing. Each flat key is just the matching `--flag` without
+the dashes:
 
 ```bash
-# found a credential (optionally say where you think it works)
+# flat form — nothing to learn but key:value
+cm cred user:jsmith pass:Summer2024 realm:CORP
+cm cred user:admin host:10.0.0.5 pass:root            # a LOCAL account on a host
+cm cred user:svc nt:00112233... realm:CORP at:10.0.0.9 proto:mssql
+cm cred --null at:10.0.0.5 proto:smb                  # SMB null session
+
+# grammar form — same result
 cm cred 'CORP\jsmith' --nt 00112233...  --src responder-mitm@10.0.0.50
 cm cred 'admin@10.0.0.20:8080' --pass Welcome1 --at 10.0.0.20:8080   # defaults to untested
 
@@ -154,6 +165,22 @@ plaintext but creates **no** access — you only get a `valid` access from `work
 `--pfx FILE` · `--ticket FILE`. Reference an **existing** one by `#id`,
 `type:value`, or a unique value-prefix.
 
+**Flat keys for `cm cred`** — each is the `--flag` above without the dashes, so
+there's one vocabulary to learn, not two. Order-free, one keyword per field:
+
+| key | = flag | key | = flag |
+|---|---|---|---|
+| `user:` | the IDENT username | `at:` | `--at` (target) |
+| `pass:` | `--pass` | `proto:` | `--proto` |
+| `nt:` | `--nt` | `priv:` | `--priv` |
+| `hash:` | `--hash` (`TYPE:VALUE`) | `status:` | `--status` |
+| `key:`/`pfx:`/`ticket:` | the blob flags | `src:` | `--src` |
+| `realm:` / `host:` / `service:` | the realm (pick one) | `desc:`/`origin:` | `--desc`/`--origin` |
+
+`realm:CORP` = a domain account, `host:10.0.0.5` = a host-local account,
+`service:HOST:PORT` = a service account — give at most one. Values may contain
+colons (`pass:a:b`, `hash:kerberos_tgs:$krb5tgs$…`); only the first `:` splits.
+
 **Target** (`--at`): `HOST` → host scope; `HOST:PORT` → service scope. `--proto`
 sets a sensible default scope + port (`smb`→host:445, `mysql`→service:3306, …);
 `--scope host|service` forces it. **Every assumption the tool makes is printed**,
@@ -198,9 +225,19 @@ uppercase-stored hash still matches hashcat's lowercase potfile; the password's
 case is kept), idempotent on re-run, and it **prints in full any cracked hash it
 can't find in the db** so you notice one you forgot to add.
 
+**Which mode?** `cm hashes`, `cm todo-crack` and `cm export hashes` print the
+exact `hashcat -m …` / `john --format=…` for each hash type **to stderr**, so you
+never look it up — and because it's stderr, your redirect (`> v2.hash`) stays
+clean:
+
+```
+$ cm export hashes --type netntlmv2 > v2.hash
+# netntlmv2      hashcat -m 5600 | john --format=netntlmv2
+```
+
 Typical round-trip:
 ```bash
-cm export hashes --type netntlmv2 > v2.hash
+cm export hashes --type netntlmv2 > v2.hash   # tells you it's -m 5600
 hashcat -m 5600 v2.hash rockyou.txt
 cm cracked --from ~/.local/share/hashcat/hashcat.potfile
 ```
@@ -222,6 +259,23 @@ cm export pairs --type plaintext --introduced   # only creds YOU planted (cleanu
 cm export hashes --type kerberos_tgs > tgs.hash  # straight into hashcat/john
 cm export key '#12' > id_rsa                     # write a key/pfx/ticket blob back out
 ```
+
+**Online attacks (spray / reuse / pass-the-hash)** — split lists feed NetExec,
+hydra or kerbrute directly. `export passwords` is already a reuse wordlist of
+plaintexts *actually seen in the environment*, so spraying it hunts password
+reuse without noise:
+
+```bash
+cm export users     > users.txt
+cm export passwords > pass.txt
+nxc smb 10.0.0.0/24 -u users.txt -p pass.txt --continue-on-success   # reuse spray
+cm export pairs --type ntlm | sed 's/:/ /' | while read u h; do \
+    nxc smb TARGET -u "$u" -H "$h"; done                             # pass-the-hash
+```
+
+`fail` keeps spray lists safe: a disproven guess is recorded as an `invalid`
+access but never re-emitted into `export pairs`, so you don't re-spray a known-bad
+credential (and risk lockout).
 
 ---
 
@@ -259,7 +313,7 @@ Rules the tool enforces:
 ```
 init                 create / ensure an engagement db
 # record
-cred    IDENT ...    record a credential (+ optional target)
+cred    IDENT ... | user:…pass:…realm:…    record a credential (+ optional target)
 works   IDENT --at   confirm a working login (status=valid)
 fail    IDENT --at   record a failed login (status=invalid)
 cracked REF|--from   a hash resolved to a plaintext
@@ -270,8 +324,8 @@ stats                summary counts
 show    user|secret  one identity / secret in full
 where                accesses: --user X | --host Y | (none)=all | --valid
 users                list identities                      (--domain/--host/--realm)
-hashes  --type T     list stored hashes of a type
-todo-crack           crackable, not yet cracked, still live
+hashes  --type T     list stored hashes of a type   (+ hashcat/john hint on stderr)
+todo-crack           crackable, not yet cracked, still live  (+ crack command)
 # export
 export  users|passwords|pairs|hashes|key
 # import   (run any with no file to print its expected format)
@@ -314,5 +368,5 @@ cm ls --valid                                              # what do I have that
 ## Tests
 
 ```bash
-python3 tests/test_scenarios.py     # replays 28 engagement scenarios against a real db
+python3 tests/test_scenarios.py     # replays 33 engagement scenarios against a real db
 ```
