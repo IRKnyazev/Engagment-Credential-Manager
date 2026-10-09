@@ -2000,7 +2000,12 @@ def build_parser():
     p.add_argument("--db", help="engagement database (env CM_DB, default ./engagement.db)")
     p.add_argument("-q", "--quiet", action="store_true", help="suppress the teaching echo lines")
     p.add_argument("--version", action="version", version="cm " + VERSION)
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Groups are NOT required: running a bare group (`cm`, `cm import`, `cm add`)
+    # prints that group's help (see main) instead of an argparse error naming an
+    # internal dest like 'impkind' that the user never typed. _group_parser lets
+    # main find the right help to print.
+    sub = p.add_subparsers(dest="cmd")
+    p.set_defaults(_group_parser=p)
 
     # init
     sp = sub.add_parser("init", help="create / ensure an engagement db")
@@ -2076,7 +2081,8 @@ def build_parser():
 
     # add (atomic group)
     sp = sub.add_parser("add", help="atomic adders")
-    asub = sp.add_subparsers(dest="addkind", required=True)
+    sp.set_defaults(_group_parser=sp)
+    asub = sp.add_subparsers(dest="addkind")
     a = asub.add_parser("host"); a.add_argument("name"); a.add_argument("--os")
     a.set_defaults(func=cmd_add_host)
     a = asub.add_parser("domain"); a.add_argument("fqdn"); a.set_defaults(func=cmd_add_domain)
@@ -2119,7 +2125,8 @@ def build_parser():
 
     # import  (run any of these with no file to see the exact input format)
     sp = sub.add_parser("import", help="bulk import from tool output (run with no file to see its format)")
-    isub = sp.add_subparsers(dest="impkind", required=True)
+    sp.set_defaults(_group_parser=sp)
+    isub = sp.add_subparsers(dest="impkind")
     i = isub.add_parser("passwd", help="Linux /etc/passwd (login-shell users)")
     i.add_argument("--host"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_passwd)
     i = isub.add_parser("shadow", help="Linux /etc/shadow (attach hashes)")
@@ -2195,10 +2202,13 @@ def resolve_db_path(args):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = build_parser()
-    if not argv:
-        parser.print_help()
-        return 0
     args = parser.parse_args(argv)
+    if getattr(args, "func", None) is None:
+        # a command group was given with no subcommand (bare `cm`, `cm import`,
+        # `cm add`): show that group's help rather than opening a db or dumping
+        # an argparse 'the following arguments are required: impkind' error.
+        getattr(args, "_group_parser", parser).print_help()
+        return 0
     color = C(_use_color())
     db_path = resolve_db_path(args)
     store = Store(db_path, color, echo=not args.quiet)

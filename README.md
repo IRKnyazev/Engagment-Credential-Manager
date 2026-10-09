@@ -368,5 +368,5 @@ cm ls --valid                                              # what do I have that
 ## Tests
 
 ```bash
-python3 tests/test_scenarios.py     # replays 33 engagement scenarios against a real db
+python3 tests/test_scenarios.py     # replays 34 engagement scenarios against a real db
 ```

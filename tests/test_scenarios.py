@@ -603,6 +603,29 @@ def invariant_crack_hints(cx):
     assert "hashcat -m 1000" in cx.run("todo-crack")
 
 
+def invariant_bare_group_prints_help(cx):
+    # a command group with no subcommand (bare `cm`, `cm import`, `cm add`) must
+    # print that group's help and exit 0 -- never argparse's internal
+    # "the following arguments are required: impkind" -- and must touch no db.
+    fresh = os.path.join(cx.workdir, "untouched", "e.db")   # parent dir doesn't exist
+    for argv, needle in (([], "{init,cred"),
+                         (["import"], "passwd"),
+                         (["add"], "{host,domain,service,user,secret}")):
+        env = dict(os.environ, NO_COLOR="1", CM_DB=fresh)
+        proc = subprocess.run([sys.executable, CM, *argv], capture_output=True, text=True, env=env)
+        out = proc.stdout + proc.stderr
+        assert proc.returncode == 0, "cm %s should exit 0, got %d:\n%s" % (argv, proc.returncode, out)
+        assert needle in out, "cm %s should list its subcommands (%r):\n%s" % (argv, needle, out)
+        assert "impkind" not in out and "addkind" not in out, \
+            "internal dest name leaked into `cm %s` output:\n%s" % (" ".join(argv), out)
+    assert not os.path.exists(fresh), "a bare-group help invocation must not create a database"
+    # a genuinely invalid subcommand must still fail (exit != 0), listing choices
+    bad = subprocess.run([sys.executable, CM, "import", "bogus"],
+                         capture_output=True, text=True, env=dict(os.environ, NO_COLOR="1", CM_DB=cx.db))
+    assert bad.returncode != 0 and "invalid choice" in bad.stderr, \
+        "an unknown importer should still be a clean error:\n%s" % bad.stderr
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -642,6 +665,7 @@ def main():
         ("INV flat add == grammar add (same rows)", invariant_flat_add_equivalence),
         ("INV flat add variants (host:/nt:/at:/--null/errors)", invariant_flat_add_variants),
         ("INV crack hints print to stderr, not stdout", invariant_crack_hints),
+        ("INV bare command group prints help, not an argparse dump", invariant_bare_group_prints_help),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:
