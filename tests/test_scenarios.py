@@ -626,6 +626,29 @@ def invariant_bare_group_prints_help(cx):
         "an unknown importer should still be a clean error:\n%s" % bad.stderr
 
 
+def invariant_flat_syntax_rejected_in_grammar(cx):
+    # flat `cred` keys (user:/host:/...) must NOT be taken literally by the
+    # identity grammar: `cm add user user:dave` used to create a username
+    # "user:dave", which then broke `cm merge`. Now it's a clean teaching error.
+    out = cx.run("add", "user", "user:dave", expect_fail=True)
+    assert "flat" in out and "did you mean just 'dave'" in out, \
+        "add user user:dave should give a flat-syntax hint:\n" + out
+    # the @-qualified mistake is caught too (prefix before the first ':' is 'user')
+    assert "flat" in cx.run("add", "user", "user:dave@10.9.9.9", expect_fail=True)
+    # merge (the command the user actually hit) gives the same clean error
+    assert "flat" in cx.run("merge", "user:dave", "user:dave@10.9.9.9", expect_fail=True)
+    # no junk identity was created by any of the above
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username LIKE 'user:%'") == 0
+    # the correct forms still work and dedupe to ONE identity
+    cx.run("add", "user", "dave@10.9.9.9")
+    cx.run("cred", "user:dave", "pass:ReuseMe", "host:10.9.9.9")   # flat on cred: allowed
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='dave' "
+                 "AND realm_type='host' AND realm_id=(SELECT id FROM hosts WHERE name='10.9.9.9')") == 1
+    # a legitimate service identity whose token contains a colon is NOT rejected
+    cx.run("add", "user", "svcport@10.9.9.9:8443")
+    assert cx.q1("SELECT realm_type FROM identities WHERE username='svcport'") == "service"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -666,6 +689,7 @@ def main():
         ("INV flat add variants (host:/nt:/at:/--null/errors)", invariant_flat_add_variants),
         ("INV crack hints print to stderr, not stdout", invariant_crack_hints),
         ("INV bare command group prints help, not an argparse dump", invariant_bare_group_prints_help),
+        ("INV flat cred syntax is rejected in the identity grammar", invariant_flat_syntax_rejected_in_grammar),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:

@@ -100,6 +100,15 @@ SCOPES = ("host", "service")
 STATUSES = ("valid", "invalid", "untested", "expired")
 HOST_PRIVS = ("user", "local_admin", "domain_admin", "root")
 
+# flat `key:value` tokens accepted by `cred`. One keyword per field, no synonyms;
+# each is just the matching `--flag` without the dashes (so `--nt HASH` <-> `nt:HASH`),
+# plus the `realm:`/`host:`/`service:` shortcuts that stand in for `--realm`. These
+# are a `cm cred` convenience ONLY; parse_principal rejects them in the identity
+# grammar so `cm add user user:dave` can't bake "user:" into a username.
+FLAT_KEYS = {"user", "pass", "nt", "hash", "key", "pfx", "ticket", "realm",
+             "host", "service", "at", "proto", "priv", "status", "src", "desc",
+             "expires", "label", "origin"}
+
 # protocol -> (default scope, default port). Everything is overridable with
 # --scope / an explicit port; the tool prints every assumption it makes.
 PROTO_DEFAULTS = {
@@ -291,6 +300,16 @@ def parse_principal(token):
         user@host:port        -> service (that specific service)
         user                  -> no realm encoded (caller supplies --realm)
     """
+    # Guard: a token like `user:dave` or `host:1.2.3.4` is flat `cred` syntax,
+    # which ONLY `cm cred` accepts. In the identity grammar it would otherwise be
+    # taken literally (username "user:dave"), so reject it with a hint. cred never
+    # reaches here with such a token - it strips flat keys before resolving.
+    if ":" in token and token.partition(":")[0] in FLAT_KEYS:
+        key, _, rest = token.partition(":")
+        hint = (" - did you mean just %r?" % rest) if key == "user" and rest else ""
+        raise CmError("%r looks like flat `cred` syntax; only `cm cred` takes "
+                      "key:value tokens. Here, write the identity itself: "
+                      "NAME, NAME@HOST, or DOMAIN\\NAME%s" % (token, hint))
     if "\\" in token:
         left, _, user = token.partition("\\")
         return user, ("domain", left)
@@ -885,14 +904,6 @@ def pick_secret_for_identity(store, args, identity_id, action):
 # --------------------------------------------------------------------------
 # macro commands
 # --------------------------------------------------------------------------
-
-# flat `key:value` tokens accepted by `cred`. One keyword per field, no synonyms;
-# each is just the matching `--flag` without the dashes (so `--nt HASH` <-> `nt:HASH`),
-# plus the `realm:`/`host:`/`service:` shortcuts that stand in for `--realm`.
-FLAT_KEYS = {"user", "pass", "nt", "hash", "key", "pfx", "ticket", "realm",
-             "host", "service", "at", "proto", "priv", "status", "src", "desc",
-             "expires", "label", "origin"}
-
 
 def _apply_flat_cred(args):
     """Map flat `user:x pass:y realm:z` tokens onto the normal cred args.
