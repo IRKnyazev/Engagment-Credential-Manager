@@ -649,6 +649,35 @@ def invariant_flat_syntax_rejected_in_grammar(cx):
     assert cx.q1("SELECT realm_type FROM identities WHERE username='svcport'") == "service"
 
 
+def invariant_partial_knowledge_entries(cx):
+    # the three real "partial knowledge" shapes must each record cleanly AND stay
+    # visible: (1) foothold w/ unknown password -> identity, no secret;
+    # (2) loose password, owner+host unknown -> bare secret shown under "loose
+    # secrets" with its provenance; (3) known user+pass on a host -> normal cred.
+    cx.run("add", "user", "dave@10.7.7.7", "--desc", "bind shell; password unknown")
+    cx.run("add", "secret", "--pass", "paperEarMonitor33@",
+           "--src", "pwsh history; for computer Srv02X (ip unknown)")
+    cx.run("cred", "daveadmin@10.7.7.7", "--pass", "qZz!localpw", "--src", "pwsh history")
+    # (1) identity exists with no secret
+    did = cx.q1("SELECT id FROM identities WHERE username='dave' "
+                "AND realm_id=(SELECT id FROM hosts WHERE name='10.7.7.7')")
+    assert did is not None and cx.q1(
+        "SELECT COUNT(*) FROM identity_secrets WHERE identity_id=?", (did,)) == 0
+    # (2) the loose secret is owned by nobody, and `cm ls` surfaces it + its note
+    sid = cx.q1("SELECT id FROM secrets WHERE value='paperEarMonitor33@'")
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets WHERE secret_id=?", (sid,)) == 0
+    out = cx.run("ls")
+    assert "loose secrets" in out and "paperEarMonitor33@" in out and "Srv02X" in out, \
+        "an ownerless secret must show in `cm ls` with its provenance:\n" + out
+    # (3) daveadmin owns its plaintext on the host
+    assert cx.q1("SELECT s.type FROM secrets s JOIN identity_secrets il ON il.secret_id=s.id "
+                 "JOIN identities i ON i.id=il.identity_id WHERE i.username='daveadmin' "
+                 "AND i.realm_id=(SELECT id FROM hosts WHERE name='10.7.7.7')") == "plaintext"
+    # nothing is marked valid: recording creds creates no access (untested = no works/fail)
+    assert cx.q1("SELECT COUNT(*) FROM accesses WHERE host_id="
+                 "(SELECT id FROM hosts WHERE name='10.7.7.7')") == 0
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -690,6 +719,7 @@ def main():
         ("INV crack hints print to stderr, not stdout", invariant_crack_hints),
         ("INV bare command group prints help, not an argparse dump", invariant_bare_group_prints_help),
         ("INV flat cred syntax is rejected in the identity grammar", invariant_flat_syntax_rejected_in_grammar),
+        ("INV partial-knowledge entries record and stay visible", invariant_partial_knowledge_entries),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:

@@ -1843,6 +1843,26 @@ def cmd_ls(store, args):
             col = status_col.get(a["status"], c.dim)
             print("      %s %s%s  %s%s" % (c.dim("->"), proto, tgt, col(a["status"]), priv))
 
+    if not filtered:
+        # secrets owned by no identity yet (e.g. a password found before you know
+        # whose it is). Without this they're invisible in the overview and in
+        # `export passwords`, so show them with their provenance note for context.
+        loose = store.conn.execute(
+            "SELECT id, type, value FROM secrets s "
+            "WHERE NOT EXISTS (SELECT 1 FROM identity_secrets il WHERE il.secret_id=s.id) "
+            "ORDER BY type, id").fetchall()
+        if loose:
+            print(c.bold("\nloose secrets (%d):" % len(loose)) + c.dim("  owned by no identity yet"))
+            for s in loose:
+                val = "(blob)" if s["type"] in BLOB_TYPES else s["value"]
+                note = store.conn.execute(
+                    "SELECT method FROM observations WHERE secret_id=? AND method!='' "
+                    "ORDER BY found_at DESC LIMIT 1", (s["id"],)).fetchone()
+                line = "  #%d %s %s" % (s["id"], s["type"], val)
+                if note:
+                    line += c.dim("  (%s)" % note["method"])
+                print(line)
+
     todo = store.conn.execute(
         "SELECT COUNT(*) FROM secrets s WHERE s.type IN (%s) "
         "AND NOT EXISTS (SELECT 1 FROM secret_links sl WHERE sl.to_secret_id=s.id AND sl.relation='cracks') "

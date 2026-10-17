@@ -138,6 +138,26 @@ plaintext but creates **no** access — you only get a `valid` access from `work
 `cm add host|domain|service|user|secret` · `cm link` · `cm access` ·
 `cm supersede` · `cm observe` · `cm unlock` · `cm merge`.
 
+**Recording partial knowledge** — note only what you actually know; fill the rest
+in later:
+
+```bash
+# a foothold/shell but you don't know the password -> an identity, no secret
+cm add user dave@10.0.0.5 --desc 'bind shell; password unknown'
+
+# a password but you don't know whose it is -> a loose (ownerless) secret;
+# keep the context in --src. It shows under "loose secrets" in `cm ls`.
+cm add secret --pass 'paperEarMonitor33@' --src 'pwsh history; for computer Server02 (ip unknown)'
+
+# a full user:pass for a host -> a normal cred (local account = user@host)
+cm cred daveadmin@10.0.0.5 --pass 'qwertqwert123!!' --src 'pwsh history'
+```
+
+"Untested" is simply the absence of a `works`/`fail` — recording a cred creates
+**no** access, so there's nothing to mark. When you later try one, run
+`cm works`/`cm fail`; a status only appears once you give `--at`. Attach the
+owner/host to a loose secret later with `cm link` once you learn it.
+
 ---
 
 ## 3. Naming identities and targets
@@ -368,5 +388,5 @@ cm ls --valid                                              # what do I have that
 ## Tests
 
 ```bash
-python3 tests/test_scenarios.py     # replays 35 engagement scenarios against a real db
+python3 tests/test_scenarios.py     # replays 36 engagement scenarios against a real db
 ```
