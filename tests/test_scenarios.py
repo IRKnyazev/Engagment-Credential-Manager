@@ -608,9 +608,9 @@ def invariant_bare_group_prints_help(cx):
     # print that group's help and exit 0 -- never argparse's internal
     # "the following arguments are required: impkind" -- and must touch no db.
     fresh = os.path.join(cx.workdir, "untouched", "e.db")   # parent dir doesn't exist
-    for argv, needle in (([], "{init,cred"),
+    for argv, needle in (([], "<command>"),
                          (["import"], "passwd"),
-                         (["add"], "{host,domain,service,user,secret}")):
+                         (["add"], "<what>")):
         env = dict(os.environ, NO_COLOR="1", CM_DB=fresh)
         proc = subprocess.run([sys.executable, CM, *argv], capture_output=True, text=True, env=env)
         out = proc.stdout + proc.stderr

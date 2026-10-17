@@ -1980,6 +1980,10 @@ def cmd_init(store, args):
 # argument parser
 # --------------------------------------------------------------------------
 
+# shown on every command that takes an identity, so --help explains the grammar
+IDENT_HELP = "DOMAIN\\user | user@host | user@host:port  (or --null)"
+
+
 def add_secret_flags(p):
     g = p.add_argument_group("secret (choose one)")
     g.add_argument("--pass", dest="password", help="plaintext password")
@@ -2035,7 +2039,10 @@ def build_parser():
     # prints that group's help (see main) instead of an argparse error naming an
     # internal dest like 'impkind' that the user never typed. _group_parser lets
     # main find the right help to print.
-    sub = p.add_subparsers(dest="cmd")
+    # metavar="<command>" keeps the usage line short: without it argparse prints
+    # the whole {init,cred,...,export} choice list, which wraps to one-word-per-
+    # line in a narrow pane. The commands are still listed (with help) below.
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
     p.set_defaults(_group_parser=p)
 
     # init
@@ -2063,7 +2070,7 @@ def build_parser():
     for name, fn, helptext in (("works", cmd_works, "confirm a working login (status=valid)"),
                                ("fail", cmd_fail, "record a failed login (status=invalid)")):
         sp = sub.add_parser(name, help=helptext)
-        sp.add_argument("identity", nargs="?")
+        sp.add_argument("identity", nargs="?", help=IDENT_HELP)
         add_identity_flags(sp)
         add_secret_flags(sp)
         sp.add_argument("--secret", help="existing secret ref (#id, type:value, or value prefix)")
@@ -2073,7 +2080,7 @@ def build_parser():
 
     # reset (macro)
     sp = sub.add_parser("reset", help="tester-changed password: supersede old + add introduced")
-    sp.add_argument("identity", nargs="?")
+    sp.add_argument("identity", nargs="?", help=IDENT_HELP)
     add_identity_flags(sp)
     add_secret_flags(sp)
     sp.add_argument("--src", help="provenance note")
@@ -2088,7 +2095,7 @@ def build_parser():
 
     # supersede (atomic)
     sp = sub.add_parser("supersede", help="mark an identity's secret stale")
-    sp.add_argument("identity", nargs="?")
+    sp.add_argument("identity", nargs="?", help=IDENT_HELP)
     add_identity_flags(sp)
     sp.add_argument("--secret", help="which secret (ref); inferred if the identity has one live")
     sp.set_defaults(func=cmd_supersede)
@@ -2113,22 +2120,30 @@ def build_parser():
     # add (atomic group)
     sp = sub.add_parser("add", help="atomic adders")
     sp.set_defaults(_group_parser=sp)
-    asub = sp.add_subparsers(dest="addkind")
-    a = asub.add_parser("host"); a.add_argument("name"); a.add_argument("--os")
+    asub = sp.add_subparsers(dest="addkind", metavar="<what>")
+    a = asub.add_parser("host", help="a host (by name or ip)")
+    a.add_argument("name"); a.add_argument("--os")
     a.set_defaults(func=cmd_add_host)
-    a = asub.add_parser("domain"); a.add_argument("fqdn"); a.set_defaults(func=cmd_add_domain)
-    a = asub.add_parser("service"); a.add_argument("--host", required=True)
+    a = asub.add_parser("domain", help="a domain (fqdn)")
+    a.add_argument("fqdn"); a.set_defaults(func=cmd_add_domain)
+    a = asub.add_parser("service", help="a service (host + port)")
+    a.add_argument("--host", required=True)
     a.add_argument("--port", type=int, required=True); a.add_argument("--name", default="")
     a.set_defaults(func=cmd_add_service)
-    a = asub.add_parser("user"); a.add_argument("identity", nargs="?")
-    add_identity_flags(a); a.add_argument("--desc"); a.add_argument("--uid", type=int)
-    a.add_argument("--shell"); a.set_defaults(func=cmd_add_user)
-    a = asub.add_parser("secret"); add_secret_flags(a); a.add_argument("--src")
+    a = asub.add_parser("user", help="an identity with no secret yet")
+    a.add_argument("identity", nargs="?", help=IDENT_HELP)
+    add_identity_flags(a)
+    a.add_argument("--desc", help="free-text description (e.g. 'bind shell; pw unknown')")
+    a.add_argument("--uid", type=int, help="linux uid")
+    a.add_argument("--shell", help="linux shell")
+    a.set_defaults(func=cmd_add_user)
+    a = asub.add_parser("secret", help="a secret with no owner yet (shows under 'loose secrets')")
+    add_secret_flags(a); a.add_argument("--src", help="provenance note")
     a.set_defaults(func=cmd_add_secret)
 
     # link (atomic)
     sp = sub.add_parser("link", help="link a secret to an identity")
-    sp.add_argument("identity", nargs="?")
+    sp.add_argument("identity", nargs="?", help=IDENT_HELP)
     add_identity_flags(sp)
     sp.add_argument("--secret", required=True)
     sp.add_argument("--origin", choices=ORIGINS)
@@ -2136,7 +2151,7 @@ def build_parser():
 
     # access (atomic)
     sp = sub.add_parser("access", help="record an access row directly")
-    sp.add_argument("identity", nargs="?")
+    sp.add_argument("identity", nargs="?", help=IDENT_HELP)
     add_identity_flags(sp)
     add_secret_flags(sp)
     sp.add_argument("--secret")
@@ -2157,7 +2172,7 @@ def build_parser():
     # import  (run any of these with no file to see the exact input format)
     sp = sub.add_parser("import", help="bulk import from tool output (run with no file to see its format)")
     sp.set_defaults(_group_parser=sp)
-    isub = sp.add_subparsers(dest="impkind")
+    isub = sp.add_subparsers(dest="impkind", metavar="<tool>")
     i = isub.add_parser("passwd", help="Linux /etc/passwd (login-shell users)")
     i.add_argument("--host"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_passwd)
     i = isub.add_parser("shadow", help="Linux /etc/shadow (attach hashes)")
