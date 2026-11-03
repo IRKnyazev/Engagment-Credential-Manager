@@ -185,6 +185,14 @@ CREATE TABLE IF NOT EXISTS hosts (
     notes TEXT NOT NULL DEFAULT ''
 );
 
+-- alternate names for a host (an IP, a DNS name, a NetBIOS name). Any reference
+-- to one of these resolves to the host whose `name` is canonical, so the same
+-- box referenced by IP and by hostname is ONE host, not two.
+CREATE TABLE IF NOT EXISTS host_aliases (
+    host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    alias   TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+
 CREATE TABLE IF NOT EXISTS services (
     id      INTEGER PRIMARY KEY,
     host_id INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
@@ -393,16 +401,128 @@ class Store:
         self.atom("+", "domain %s" % fqdn)
         return cur.lastrowid, True
 
-    def upsert_host(self, name, os_name=None):
-        row = self.conn.execute("SELECT * FROM hosts WHERE name=?", (name,)).fetchone()
-        if row:
-            if os_name and not row["os"]:
-                self.conn.execute("UPDATE hosts SET os=? WHERE id=?", (os_name, row["id"]))
-                self.atom("~", "host %s (os=%s)" % (name, os_name))
-            return row["id"], False
-        cur = self.conn.execute("INSERT INTO hosts(name, os) VALUES(?,?)", (name, os_name))
-        self.atom("+", "host %s" % name + ((" (os=%s)" % os_name) if os_name else ""))
-        return cur.lastrowid, True
+    def resolve_host_name(self, name):
+        """Host id for `name`, matching its canonical name OR any alias; else None.
+        This is what makes 10.0.0.5 and DC01 resolve to the same host."""
+        r = self.conn.execute("SELECT id FROM hosts WHERE name=?", (name,)).fetchone()
+        if r:
+            return r["id"]
+        r = self.conn.execute("SELECT host_id FROM host_aliases WHERE alias=?", (name,)).fetchone()
+        return r["host_id"] if r else None
+
+    def upsert_host(self, name, os_name=None, aliases=None):
+        hid = self.resolve_host_name(name)
+        if hid is None:
+            cur = self.conn.execute("INSERT INTO hosts(name, os) VALUES(?,?)", (name, os_name))
+            hid, created = cur.lastrowid, True
+            self.atom("+", "host %s" % name + ((" (os=%s)" % os_name) if os_name else ""))
+        else:
+            created = False
+            if os_name and not self.conn.execute(
+                    "SELECT os FROM hosts WHERE id=?", (hid,)).fetchone()["os"]:
+                self.conn.execute("UPDATE hosts SET os=? WHERE id=?", (os_name, hid))
+                self.atom("~", "host %s (os=%s)" % (self._host_name(hid), os_name))
+        for a in (aliases or []):
+            if a:
+                self.add_host_alias(hid, a)
+        return hid, created
+
+    def add_host_alias(self, host_id, alias):
+        """Register `alias` as another name for host_id. If the alias already
+        names a DIFFERENT host, the two are the same box -> fold it in."""
+        canon = self._host_name(host_id)
+        if alias.lower() == canon.lower():
+            return
+        other = self.resolve_host_name(alias)
+        if other == host_id:
+            return
+        if other is not None:
+            self._absorb_host(host_id, other)
+            return
+        self.conn.execute("INSERT INTO host_aliases(host_id, alias) VALUES(?,?)", (host_id, alias))
+        self.atom("+", "host-alias %s = %s" % (alias, canon))
+
+    def host_alias_list(self, host_id):
+        return [r["alias"] for r in self.conn.execute(
+            "SELECT alias FROM host_aliases WHERE host_id=? ORDER BY alias", (host_id,)).fetchall()]
+
+    def _fold_identity(self, src_id, dst_id):
+        """Move src identity's secrets/accesses/observations onto dst, dropping
+        duplicates, then delete src. Shared by `merge` and host unification."""
+        moved = {"secrets": 0, "accesses": 0, "observations": 0}
+        for table, key in (("identity_secrets", "secrets"),
+                           ("accesses", "accesses"),
+                           ("observations", "observations")):
+            for row in self.conn.execute(
+                    "SELECT id FROM %s WHERE identity_id=?" % table, (src_id,)).fetchall():
+                try:
+                    self.conn.execute(
+                        "UPDATE %s SET identity_id=? WHERE id=?" % table, (dst_id, row["id"]))
+                    moved[key] += 1
+                except sqlite3.IntegrityError:
+                    self.conn.execute("DELETE FROM %s WHERE id=?" % table, (row["id"],))
+        self.conn.execute("DELETE FROM identities WHERE id=?", (src_id,))
+        return moved
+
+    def _absorb_service(self, drop_svc, keep_svc):
+        for i in self.conn.execute(
+                "SELECT id, username FROM identities WHERE realm_type='service' AND realm_id=?",
+                (drop_svc,)).fetchall():
+            dup = self.conn.execute(
+                "SELECT id FROM identities WHERE realm_type='service' AND realm_id=? AND username=?",
+                (keep_svc, i["username"])).fetchone()
+            if dup:
+                self._fold_identity(i["id"], dup["id"])
+            else:
+                self.conn.execute("UPDATE identities SET realm_id=? WHERE id=?", (keep_svc, i["id"]))
+        for a in self.conn.execute("SELECT id FROM accesses WHERE service_id=?", (drop_svc,)).fetchall():
+            try:
+                self.conn.execute("UPDATE accesses SET service_id=? WHERE id=?", (keep_svc, a["id"]))
+            except sqlite3.IntegrityError:
+                self.conn.execute("DELETE FROM accesses WHERE id=?", (a["id"],))
+        self.conn.execute("DELETE FROM services WHERE id=?", (drop_svc,))
+
+    def _absorb_host(self, keep_id, drop_id):
+        """Fold host drop_id into keep_id: move its identities, services, accesses
+        and observations (reconciling duplicates), make its names aliases of keep,
+        then delete it. Triggered when an alias turns out to name another host."""
+        if keep_id == drop_id:
+            return
+        keep_name, drop_name = self._host_name(keep_id), self._host_name(drop_id)
+        for i in self.conn.execute(
+                "SELECT id, username FROM identities WHERE realm_type='host' AND realm_id=?",
+                (drop_id,)).fetchall():
+            dup = self.conn.execute(
+                "SELECT id FROM identities WHERE realm_type='host' AND realm_id=? AND username=?",
+                (keep_id, i["username"])).fetchone()
+            if dup:
+                self._fold_identity(i["id"], dup["id"])
+            else:
+                self.conn.execute("UPDATE identities SET realm_id=? WHERE id=?", (keep_id, i["id"]))
+        for s in self.conn.execute(
+                "SELECT id, port, service FROM services WHERE host_id=?", (drop_id,)).fetchall():
+            dup = self.conn.execute(
+                "SELECT id FROM services WHERE host_id=? AND port=? AND service=?",
+                (keep_id, s["port"], s["service"])).fetchone()
+            if dup:
+                self._absorb_service(s["id"], dup["id"])
+            else:
+                self.conn.execute("UPDATE services SET host_id=? WHERE id=?", (keep_id, s["id"]))
+        for a in self.conn.execute("SELECT id FROM accesses WHERE host_id=?", (drop_id,)).fetchall():
+            try:
+                self.conn.execute("UPDATE accesses SET host_id=? WHERE id=?", (keep_id, a["id"]))
+            except sqlite3.IntegrityError:
+                self.conn.execute("DELETE FROM accesses WHERE id=?", (a["id"],))
+        for o in self.conn.execute("SELECT id FROM observations WHERE host_id=?", (drop_id,)).fetchall():
+            try:
+                self.conn.execute("UPDATE observations SET host_id=? WHERE id=?", (keep_id, o["id"]))
+            except sqlite3.IntegrityError:
+                self.conn.execute("DELETE FROM observations WHERE id=?", (o["id"],))
+        self.conn.execute("UPDATE host_aliases SET host_id=? WHERE host_id=?", (keep_id, drop_id))
+        self.conn.execute("INSERT OR IGNORE INTO host_aliases(host_id, alias) VALUES(?,?)",
+                          (keep_id, drop_name))
+        self.conn.execute("DELETE FROM hosts WHERE id=?", (drop_id,))
+        self.atom("-", "unified host %s into %s" % (drop_name, keep_name))
 
     def upsert_service(self, host_id, port, service=""):
         row = self.conn.execute(
@@ -800,12 +920,12 @@ def resolve_existing_identity(store, token):
         r = store.conn.execute("SELECT id FROM domains WHERE fqdn=?", (hint[1],)).fetchone()
         place = ("domain", r["id"]) if r else None
     elif kind == "host":
-        r = store.conn.execute("SELECT id FROM hosts WHERE name=?", (hint[1],)).fetchone()
-        place = ("host", r["id"]) if r else None
+        hid = store.resolve_host_name(hint[1])
+        place = ("host", hid) if hid else None
     elif kind == "service":
+        hid = store.resolve_host_name(hint[1])
         r = store.conn.execute(
-            "SELECT s.id AS id FROM services s JOIN hosts h ON h.id=s.host_id "
-            "WHERE h.name=? AND s.port=?", (hint[1], hint[2])).fetchone()
+            "SELECT id FROM services WHERE host_id=? AND port=?", (hid, hint[2])).fetchone() if hid else None
         place = ("service", r["id"]) if r else None
     else:
         raise CmError("merge needs qualified identities: DOMAIN\\user, user@host, or user@host:port")
@@ -1044,23 +1164,9 @@ def cmd_merge(store, args):
     dst = resolve_existing_identity(store, args.dest)
     if src["id"] == dst["id"]:
         raise CmError("source and destination are the same identity")
-    s, d = src["id"], dst["id"]
-    moved = {"secrets": 0, "accesses": 0, "observations": 0}
-    for table, key in (("identity_secrets", "secrets"),
-                       ("accesses", "accesses"),
-                       ("observations", "observations")):
-        for row in store.conn.execute(
-                "SELECT id FROM %s WHERE identity_id=?" % table, (s,)).fetchall():
-            try:
-                store.conn.execute(
-                    "UPDATE %s SET identity_id=? WHERE id=?" % table, (d, row["id"]))
-                moved[key] += 1
-            except sqlite3.IntegrityError:
-                # destination already has an equivalent row - drop the duplicate
-                store.conn.execute("DELETE FROM %s WHERE id=?" % table, (row["id"],))
     srclabel = store.identity_label_row(src)
     dstlabel = store.identity_label_row(dst)
-    store.conn.execute("DELETE FROM identities WHERE id=?", (s,))
+    moved = store._fold_identity(src["id"], dst["id"])
     store.atom("-", "merged %s into %s (%d secrets, %d accesses, %d observations)" %
                (srclabel, dstlabel, moved["secrets"], moved["accesses"], moved["observations"]))
     store.commit()
@@ -1224,7 +1330,7 @@ def cmd_unlock(store, args):
 # --------------------------------------------------------------------------
 
 def cmd_add_host(store, args):
-    store.upsert_host(args.name, getattr(args, "os", None))
+    store.upsert_host(args.name, getattr(args, "os", None), aliases=getattr(args, "alias", None))
     store.commit()
 
 
@@ -1554,7 +1660,10 @@ def cmd_import_nxc(store, args):
             stype = "plaintext"
         sid, _ = store.upsert_secret(stype, sval)
         store.link_identity_secret(iid, sid)
-        hid, _ = store.upsert_host(ip)
+        # one box, one host: nxc hands us the hostname next to the ip for free, so
+        # record it as an alias -- a later `--host <hostname>` (or SAM import) then
+        # resolves to this same host instead of splitting into a second entry.
+        hid, _ = store.upsert_host(ip, aliases=[hostname] if hostname else None)
         pdef = PROTO_DEFAULTS.get(proto, ("host", None))
         # nxc column 3 (toks[2]) is the real port - use it, not the proto default
         real_port = int(toks[2]) if len(toks) > 2 and toks[2].isdigit() else pdef[1]
@@ -1582,8 +1691,8 @@ def cmd_users(store, args):
         where.append("realm_type='domain' AND realm_id=(SELECT id FROM domains WHERE fqdn=?)")
         params.append(args.domain)
     if getattr(args, "host", None):
-        where.append("realm_type='host' AND realm_id=(SELECT id FROM hosts WHERE name=?)")
-        params.append(args.host)
+        where.append("realm_type='host' AND realm_id=?")
+        params.append(store.resolve_host_name(args.host) or -1)
     if getattr(args, "realm", None):
         where.append("realm_type=?")
         params.append(args.realm)
@@ -1657,12 +1766,12 @@ def cmd_where(store, args):
         _print_accesses(store, rows, show_user=False)
     elif getattr(args, "host", None):
         host, port = split_host_port(args.host)
-        hrow = store.conn.execute("SELECT * FROM hosts WHERE name=?", (host,)).fetchone()
-        if not hrow:
+        host_id = store.resolve_host_name(host)
+        if not host_id:
             raise CmError("no such host: %s" % host)
         rows = store.conn.execute(
             "SELECT a.* FROM accesses a LEFT JOIN services s ON s.id=a.service_id "
-            "WHERE a.host_id=? OR s.host_id=? ORDER BY a.status", (hrow["id"], hrow["id"])).fetchall()
+            "WHERE a.host_id=? OR s.host_id=? ORDER BY a.status", (host_id, host_id)).fetchall()
         print(store.c.bold("accesses on %s:" % host))
         _print_accesses(store, rows, show_user=True)
     else:
@@ -1781,27 +1890,33 @@ def cmd_ls(store, args):
             d = store.conn.execute("SELECT id FROM domains WHERE fqdn=?", (args.domain,)).fetchone()
             return ident["realm_type"] == "domain" and d and ident["realm_id"] == d["id"]
         if getattr(args, "host", None):
-            h = store.conn.execute("SELECT id FROM hosts WHERE name=?", (args.host,)).fetchone()
-            if not h:
+            hid = store.resolve_host_name(args.host)
+            if not hid:
                 return False
-            if ident["realm_type"] == "host" and ident["realm_id"] == h["id"]:
+            if ident["realm_type"] == "host" and ident["realm_id"] == hid:
                 return True
             # also include service identities on that host
             if ident["realm_type"] == "service":
                 s = store.conn.execute("SELECT host_id FROM services WHERE id=?", (ident["realm_id"],)).fetchone()
-                return s and s["host_id"] == h["id"]
+                return s and s["host_id"] == hid
             return False
         return True
 
     print(c.bold("engagement: ") + store.path)
     filtered = bool(getattr(args, "host", None) or getattr(args, "domain", None))
     if not filtered:  # with a --host/--domain filter, skip the inventory and focus on identities
-        hrows = store.conn.execute("SELECT name, os FROM hosts ORDER BY name").fetchall()
+        hrows = store.conn.execute("SELECT id, name, os FROM hosts ORDER BY name").fetchall()
         drows = store.conn.execute("SELECT fqdn FROM domains ORDER BY fqdn").fetchall()
         if hrows:
             print(c.bold("\nhosts (%d):" % len(hrows)))
             for h in hrows:
-                print("  %s%s" % (h["name"], (" (%s)" % h["os"]) if h["os"] else ""))
+                bits = []
+                if h["os"]:
+                    bits.append(h["os"])
+                aka = store.host_alias_list(h["id"])
+                if aka:
+                    bits.append("aka " + ", ".join(aka))
+                print("  %s%s" % (h["name"], ("  (%s)" % "; ".join(bits)) if bits else ""))
         if drows:
             print(c.bold("\ndomains (%d):" % len(drows)))
             for d in drows:
@@ -1962,8 +2077,8 @@ def _export_user_rows(store, args):
         where.append("realm_type='domain' AND realm_id=(SELECT id FROM domains WHERE fqdn=?)")
         params.append(args.domain)
     if getattr(args, "host", None):
-        where.append("realm_type='host' AND realm_id=(SELECT id FROM hosts WHERE name=?)")
-        params.append(args.host)
+        where.append("realm_type='host' AND realm_id=?")
+        params.append(store.resolve_host_name(args.host) or -1)
     if where:
         q += " WHERE " + " AND ".join(where)
     return store.conn.execute(q, params).fetchall()
@@ -2122,7 +2237,11 @@ def build_parser():
     sp.set_defaults(_group_parser=sp)
     asub = sp.add_subparsers(dest="addkind", metavar="<what>")
     a = asub.add_parser("host", help="a host (by name or ip)")
-    a.add_argument("name"); a.add_argument("--os")
+    a.add_argument("name", help="hostname or IP (canonical name for the host)")
+    a.add_argument("--os")
+    a.add_argument("--alias", action="append", metavar="NAME",
+                   help="another name/IP for this host (repeatable); if it already "
+                        "names a host, the two are unified into one")
     a.set_defaults(func=cmd_add_host)
     a = asub.add_parser("domain", help="a domain (fqdn)")
     a.add_argument("fqdn"); a.set_defaults(func=cmd_add_domain)

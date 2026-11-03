@@ -181,6 +181,22 @@ owner/host to a loose secret later with `cm link` once you learn it.
 > fix it with `cm merge 'MARKETINGWK01\sam' sam@<host>` (folds the first into the
 > second, moving its secrets/accesses/observations).
 
+**One box, one host (IP + name).** A host can carry alternate names, so the same
+machine referenced by its IP and by its DNS/NetBIOS name is **one** host, not two.
+Declare the pairing once and any reference (`@host`, `--at`, `--host`, imports)
+resolves to the same host:
+
+```bash
+cm add host night-city-ws --alias 10.10.10.20   # now sam@10.10.10.20 == sam@night-city-ws
+```
+
+`cm import nxc` does this for you automatically — each nxc line already pairs the
+IP and hostname, so it registers the alias and the split never happens. If you
+declare an alias that *already* names a separate host, the two are unified
+(their identities/secrets/accesses fold together) — so `--alias` doubles as the
+host-level fix when a split slipped through. `cm ls` shows a host as
+`canonical  (aka other-name)`.
+
 **Secret** (one of): `--pass X` · `--nt X` · `--hash TYPE:VALUE` · `--key FILE` ·
 `--pfx FILE` · `--ticket FILE`. Reference an **existing** one by `#id`,
 `type:value`, or a unique value-prefix.
@@ -351,7 +367,7 @@ export  users|passwords|pairs|hashes|key
 # import   (run any with no file to print its expected format)
 import  passwd|shadow|ldapdomaindump|samdump|nxc    # samdump aka pwdump/secretsdump
 # atomic / fix-ups
-add host|domain|service|user|secret · link · access · supersede · observe · unlock · merge
+add host [--alias NAME]|domain|service|user|secret · link · access · supersede · observe · unlock · merge
 ```
 
 `cm <command> --help` details any one of them.
@@ -388,5 +404,5 @@ cm ls --valid                                              # what do I have that
 ## Tests
 
 ```bash
-python3 tests/test_scenarios.py     # replays 36 engagement scenarios against a real db
+python3 tests/test_scenarios.py     # replays 39 engagement scenarios against a real db
 ```

@@ -678,6 +678,57 @@ def invariant_partial_knowledge_entries(cx):
                  "(SELECT id FROM hosts WHERE name='10.7.7.7')") == 0
 
 
+def invariant_host_alias_unifies(cx):
+    # a host declared with --alias is ONE host, reachable by either name
+    cx.run("add", "host", "aliasbox", "--alias", "10.9.0.1")
+    cx.run("cred", "u1@10.9.0.1", "--pass", "ap1")     # referenced by the alias
+    cx.run("cred", "u2@aliasbox", "--pass", "ap2")     # referenced by the canonical name
+    hid = cx.q1("SELECT id FROM hosts WHERE name='aliasbox'")
+    assert hid is not None
+    assert cx.q1("SELECT host_id FROM host_aliases WHERE alias='10.9.0.1'") == hid, "alias must point at the host"
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE realm_type='host' AND realm_id=?", (hid,)) == 2, \
+        "both references must land on the one host"
+    assert "u1@aliasbox" in cx.run("ls", "--host", "10.9.0.1"), "--host by alias must resolve"
+
+
+def invariant_host_alias_absorb(cx):
+    # two separately-created hosts for the same box fold together when the alias
+    # is declared later; the duplicate identity reconciles, keeping both secrets.
+    cx.run("cred", "svc@10.9.0.2", "--pass", "viaip")
+    cx.run("cred", "svc@absorbbox", "--pass", "viadns")
+    cx.run("works", "svc@absorbbox", "--at", "absorbbox", "--proto", "ssh")
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name IN ('10.9.0.2','absorbbox')") == 2
+    cx.run("add", "host", "absorbbox", "--alias", "10.9.0.2")       # declare them the same -> absorb
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='10.9.0.2'") == 0, "the IP host must fold away"
+    hid = cx.q1("SELECT id FROM hosts WHERE name='absorbbox'")
+    svid = cx.q1("SELECT id FROM identities WHERE username='svc' AND realm_id=?", (hid,))
+    assert svid is not None
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='svc' AND realm_id=?", (hid,)) == 1, \
+        "the two svc identities must reconcile into one on this host"
+    assert cx.q1("SELECT COUNT(*) FROM identity_secrets WHERE identity_id=?", (svid,)) == 2, \
+        "both passwords must be kept"
+    assert cx.q1("SELECT COUNT(*) FROM accesses WHERE identity_id=?", (svid,)) == 1, "the access must survive"
+
+
+def invariant_nxc_sam_unify_by_alias(cx):
+    # the Lab-03 split: SAM import by hostname + an nxc run by IP must converge on
+    # ONE host, because nxc registers the hostname<->ip pairing it sees.
+    nt = "ab" + "0" * 30
+    sam = os.path.join(cx.workdir, "unify.sam")
+    with open(sam, "w") as fh:
+        fh.write("localadmin:1001:aad3b435b51404eeaad3b435b51404ee:%s:::\n" % nt)
+    cx.run("import", "samdump", "--host", "unifybox", sam)          # creates host 'unifybox'
+    nxcf = os.path.join(cx.workdir, "unify.nxc")
+    with open(nxcf, "w") as fh:
+        fh.write("SMB  10.9.0.3  445  UNIFYBOX  [+] UNIFYBOX\\localadmin:%s (Pwn3d!)\n" % nt)
+    cx.run("import", "nxc", nxcf)                                   # references ip + hostname
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='localadmin'") == 1, \
+        "the local admin must not split across hostname and ip"
+    hid = cx.q1("SELECT id FROM hosts WHERE name='10.9.0.3'")
+    assert hid is not None and cx.q1("SELECT host_id FROM host_aliases WHERE alias='unifybox'") == hid
+    assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='unifybox'") == 0, "the hostname host folded into the ip host"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -720,6 +771,9 @@ def main():
         ("INV bare command group prints help, not an argparse dump", invariant_bare_group_prints_help),
         ("INV flat cred syntax is rejected in the identity grammar", invariant_flat_syntax_rejected_in_grammar),
         ("INV partial-knowledge entries record and stay visible", invariant_partial_knowledge_entries),
+        ("INV host alias unifies references by name and ip", invariant_host_alias_unifies),
+        ("INV host alias absorbs a pre-existing duplicate host", invariant_host_alias_absorb),
+        ("INV nxc+SAM converge on one host via the hostname alias", invariant_nxc_sam_unify_by_alias),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:

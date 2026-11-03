@@ -85,47 +85,55 @@ imported: 2 NT hash(es)
 
 ---
 
-## Step 5 — An `nxc` spray run (watch the realms)
+## Step 5 — An `nxc` spray run (IP and hostname auto-unify)
 
-Importing a NetExec run shows how `cm` separates domain from local on the fly: a
-`DOMAIN\user` where the domain equals the hostname is treated as a **local**
-account, not a bogus domain.
+Step 4's SAM filed the box under its **hostname** (`night-city-ws`); this nxc run
+references it by **IP** (`10.10.10.20`). `cm` reads the IP↔hostname pairing nxc
+prints on every line and registers it as an alias, so the box stays **one host** —
+no split, nothing to merge.
 
 ```bash
-cm import nxc spray.nxc
+cm import nxc spray.nxc       # 2 logins: arasaka.corp\david.martinez and NIGHT-CITY-WS\Administrator
 ```
 ```
 imported: 2 valid login(s) from nxc output
 ```
-
-The nxc run referenced the box by **IP** (`10.10.10.20`), while Step 4's SAM used
-the **hostname** (`night-city-ws`) — so the same local Administrator is now filed
-twice:
-
 ```bash
-cm users | grep -i administrator
+cm ls | sed -n '/hosts/,/domains/p'
 ```
 ```
-Administrator@night-city-ws
-Administrator@10.10.10.20
+hosts (2):
+  10.10.10.20  (aka night-city-ws)
+  arasaka-dc01
+
+domains (1):
 ```
+
+The SAM's `Administrator@night-city-ws` and the nxc's `Administrator@10.10.10.20`
+are now the **same** identity on the one host — no duplicate, no merge.
+
+> Reference a box by IP in one place and by name in another and they still land on
+> one host — declare it yourself any time with `cm add host NAME --alias OTHER`.
 
 ---
 
-## Step 6 — `merge` the split (hostname vs IP = same box)
+## Step 6 — `merge` the one split aliases *don't* fix (domain vs local)
 
-Fold the IP-keyed identity into the hostname one; its secrets, accesses and
-observations move over, and the empty duplicate is removed.
+Host aliases unify two **names for one box**. They don't help when the same
+*account* is filed under two different **realms** — e.g. Responder captured
+`NIGHT-CITY-WS\localadmin` (the `\` made `cm` read it as a *domain*), while nxc saw
+it as the **local** `localadmin@night-city-ws`. That's what `merge` is for:
 
 ```bash
-cm merge 'Administrator@10.10.10.20' 'Administrator@night-city-ws'
+cm merge 'NIGHT-CITY-WS\localadmin' 'localadmin@10.10.10.20'
 ```
 ```
-  - merged Administrator@10.10.10.20 into Administrator@night-city-ws (0 secrets, 1 accesses, 0 observations)
+  - merged NIGHT-CITY-WS\localadmin into localadmin@10.10.10.20 (1 secrets, 0 accesses, 1 observations)
 ```
 
-> Avoid the split in the first place by picking one spelling per host. When it
-> happens anyway, `merge` reconciles it.
+> Tell-tale that `COMPUTER\user` is really local, not a domain:
+> `NetBIOS_Domain_Name == NetBIOS_Computer_Name` in your scan. File it as
+> `user@host` from the start.
 
 ---
 
@@ -141,18 +149,18 @@ certipy req -u david.martinez@arasaka.corp -p 'Samurai2077!' -ca ARASAKA-CA -tem
 ```
 ```bash
 cm cred 'arasaka.corp\hanako.arasaka' --pfx hanako.pfx --src 'Certipy ESC1 (ESC1 vuln template)'
-cm unlock --pfx '#7' --passphrase 'certipy'
+cm unlock --pfx '#9' --passphrase 'certipy'
 ```
 ```
-  + secret #7 certificate_pfx (blob)
-  + secret #8 plaintext certipy
-  + unlocks #8 plaintext certipy -> #7 certificate_pfx (blob)
+  + secret #9 certificate_pfx (blob)
+  + secret #10 plaintext certipy
+  + unlocks #10 plaintext certipy -> #9 certificate_pfx (blob)
 [note: passphrase links to the key, not to any login]
 ```
 
-The passphrase (`#8`) is owned by no identity, so it appears under **loose
+The passphrase (`#10`) is owned by no identity, so it appears under **loose
 secrets** in `cm ls` — correct: it belongs to the *key*, not to a person. Dump the
-PFX back out any time with `cm export key '#7' > hanako.pfx`.
+PFX back out any time with `cm export key '#9' > hanako.pfx`.
 
 ---
 
@@ -173,8 +181,8 @@ cm show user 'arasaka.corp\hanako.arasaka'
 ```
 arasaka.corp\hanako.arasaka
   secrets:
-    #7 certificate_pfx (blob)
-    #11 ntlm caffe00dd11ee22ff33445566778899a
+    #9 certificate_pfx (blob)
+    #13 ntlm caffe00dd11ee22ff33445566778899a
   found via: Certipy ESC1 (ESC1 vuln template), ntds-dump
 ```
 
@@ -192,11 +200,21 @@ cm export pairs --introduced
 goro.takemura:Claude_Reset_2026!
 ```
 
-And the usual payoff views:
+And the usual payoff views — note every host login is against the single unified
+box (`10.10.10.20`), not split across IP and hostname:
 ```bash
-cm where --valid          # confirmed logins (domain + local, deduped after the merge)
+cm where --valid
+```
+```
+valid accesses:
+  arasaka.corp\david.martinez  smb/arasaka-dc01  valid  [user]
+  arasaka.corp\david.martinez  smb/10.10.10.20  valid  [user]
+  Administrator@10.10.10.20  smb/10.10.10.20  valid  [local_admin]
+  localadmin@10.10.10.20  smb/10.10.10.20  valid  [local_admin]
+```
+```bash
 cm export pairs --type ntlm   # pass-the-hash list
-cm ls                     # full picture incl. '[introduced]' and 'loose secrets'
+cm ls                         # full picture incl. '[introduced]' and 'loose secrets'
 ```
 
 ## `cm` features this lab exercised
@@ -204,8 +222,10 @@ cm ls                     # full picture incl. '[introduced]' and 'loose secrets
 - **`reset`** — a password *you* set via ACL abuse, recorded as `introduced`
   (and auto-supersedes any prior secret)
 - **`export pairs --introduced`** — the revert-this remediation list
-- `import nxc` — console output, local-vs-domain realm handling
-- **`merge`** — reconcile the same host seen by hostname and by IP
+- `import nxc` — console output, local-vs-domain realm handling, **auto-unifies**
+  the box by IP and hostname (host aliases — no split, no merge)
+- **`merge`** — reconcile an *account* filed under two realms (domain vs local);
+  the thing host aliases don't fix
 - `cred --pfx` + **`unlock --passphrase`** — certificate blob + its passphrase as a
   secret-to-secret `unlocks` link (shows under *loose secrets*)
 - `export key` — write a stored key/pfx/ticket blob back to disk
