@@ -86,6 +86,7 @@ The rest of the query surface, by question:
 | where does **this cred** work | `cm where --user 'CORP\jsmith'` |
 | who works on **this box** | `cm where --host HOST4` |
 | every confirmed login (lateral-movement view) | `cm where --valid` |
+| where do I have **admin** (local/domain admin, root) | `cm where --admin` |
 | list identities | `cm users` · `cm users --domain CORP.LOCAL` · `cm users --host 10.0.0.5` |
 | hashes of one type | `cm hashes --type kerberos_tgs` |
 | what's left to crack | `cm todo-crack` |
@@ -233,6 +234,8 @@ cm import ldapdomaindump --domain CORP.LOCAL domain_users.json
 cm import samdump        --host 10.0.0.5 relay.log      # SAM dump -> local accounts
 cm import samdump        --domain CORP.LOCAL ntds.out   # NTDS dump -> domain accounts
 cm import nxc            smb.nxc                        # NetExec console output; Pwn3d! -> admin
+cm import kerberoast     --domain CORP.LOCAL tgs.hashes # impacket GetUserSPNs $krb5tgs$ output
+cm import asrep          --domain CORP.LOCAL asrep.hashes # impacket GetNPUsers $krb5asrep$ output
 ```
 
 `samdump` is the `name:rid:lmhash:nthash:::` (pwdump) format — from
@@ -358,14 +361,14 @@ reset   IDENT        you changed the target's password (introduced)
 ls                   whole-engagement overview            (--host/--domain/--valid)
 stats                summary counts
 show    user|secret  one identity / secret in full
-where                accesses: --user X | --host Y | (none)=all | --valid
+where                accesses: --user X | --host Y | (none)=all | --valid | --admin
 users                list identities                      (--domain/--host/--realm)
 hashes  --type T     list stored hashes of a type   (+ hashcat/john hint on stderr)
 todo-crack           crackable, not yet cracked, still live  (+ crack command)
 # export
 export  users|passwords|pairs|hashes|key
 # import   (run any with no file to print its expected format)
-import  passwd|shadow|ldapdomaindump|samdump|nxc    # samdump aka pwdump/secretsdump
+import  passwd|shadow|ldapdomaindump|samdump|nxc|kerberoast|asrep   # samdump aka pwdump/secretsdump
 # atomic / fix-ups
 add host [--alias NAME]|domain|service|user|secret · link · access · supersede · observe · unlock · merge
 ```

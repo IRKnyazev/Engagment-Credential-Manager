@@ -33,6 +33,7 @@ for one command.
 import argparse
 import base64
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -99,6 +100,7 @@ RELATIONS = ("cracks", "unlocks")
 SCOPES = ("host", "service")
 STATUSES = ("valid", "invalid", "untested", "expired")
 HOST_PRIVS = ("user", "local_admin", "domain_admin", "root")
+ELEVATED_PRIVS = ("local_admin", "domain_admin", "root")  # what `cm where --admin` counts
 
 # flat `key:value` tokens accepted by `cred`. One keyword per field, no synonyms;
 # each is just the matching `--flag` without the dashes (so `--nt HASH` <-> `nt:HASH`),
@@ -1452,6 +1454,18 @@ IMPORT_FORMATS = {
         "  line:  PROTO  IP  PORT  HOSTNAME  [+] DOMAIN\\user:secret (Pwn3d!)\n"
         "  note:  only [+] successes imported; (Pwn3d!) -> admin; HOSTNAME\\user == local\n"
         "  e.g.:  nxc smb 10.0.0.5 -u u -p p > smb.nxc ; cm import nxc smb.nxc"),
+    "kerberoast": (
+        "  impacket-GetUserSPNs -request output ($krb5tgs$...), one hash per line.\n"
+        "  optional: --domain <fqdn>  (else the realm is read from each hash)\n"
+        "  note:  stores each as a kerberos_tgs secret on DOMAIN\\<account>; then a\n"
+        "         `cm cracked --from <potfile>` links the plaintext automatically.\n"
+        "  e.g.:  cm import kerberoast --domain corp.com kerberoast.hashes"),
+    "asrep": (
+        "  impacket-GetNPUsers -request output ($krb5asrep$...), one hash per line.\n"
+        "  optional: --domain <fqdn>  (else the realm is read from each hash)\n"
+        "  note:  stores each as a kerberos_asrep secret on DOMAIN\\<account>; then a\n"
+        "         `cm cracked --from <potfile>` links the plaintext automatically.\n"
+        "  e.g.:  cm import asrep --domain corp.com asrep.hashes"),
 }
 
 
@@ -1680,6 +1694,55 @@ def cmd_import_nxc(store, args):
     print("%s %d valid login(s) from nxc output" % (store.c.bold("imported:"), count))
 
 
+# roast importers: each line of an impacket GetUserSPNs/GetNPUsers -outputfile is
+# one hashcat-ready hash whose account (and realm) are embedded in the string.
+ROAST_SPECS = {
+    "kerberoast": {
+        "stype": "kerberos_tgs", "src": "kerberoast", "label": "Kerberoast TGS",
+        # $krb5tgs$<etype>$*<user>$<REALM>$<spn>*$<checksum>$<edata>
+        "re": re.compile(r'^\$krb5tgs\$(?:\d+\$)?\*([^$]+)\$([^$]+)\$'),
+    },
+    "asrep": {
+        "stype": "kerberos_asrep", "src": "asreproast", "label": "AS-REP",
+        # $krb5asrep$<etype>$<user>@<REALM>:<checksum>$<edata>
+        "re": re.compile(r'^\$krb5asrep\$(?:\d+\$)?([^@]+)@([^:]+):'),
+    },
+}
+
+
+def _import_roast(store, args, kind):
+    spec = ROAST_SPECS[kind]
+    if not getattr(args, "file", None):
+        return show_import_format(store, kind)
+    count = 0
+    store.echo_enabled = False
+    for line in _read_lines(args.file):
+        line = line.strip()
+        m = spec["re"].match(line)
+        if not m:
+            continue                       # skip blanks / log noise / other hash types
+        user, realm = m.group(1), (args.domain or m.group(2))
+        if not user or not realm:
+            continue
+        did, _ = store.upsert_domain(realm)
+        iid, _ = store.upsert_identity(user, "domain", did)
+        sid, _ = store.upsert_secret(spec["stype"], line)   # stored verbatim; matches the potfile
+        store.link_identity_secret(iid, sid)
+        store.add_observation(spec["src"], identity_id=iid, secret_id=sid)
+        count += 1
+    store.commit()
+    store.echo_enabled = True
+    print("%s %d %s hash(es)" % (store.c.bold("imported:"), count, spec["label"]))
+
+
+def cmd_import_kerberoast(store, args):
+    _import_roast(store, args, "kerberoast")
+
+
+def cmd_import_asrep(store, args):
+    _import_roast(store, args, "asrep")
+
+
 # --------------------------------------------------------------------------
 # queries & exports
 # --------------------------------------------------------------------------
@@ -1776,12 +1839,21 @@ def cmd_where(store, args):
         _print_accesses(store, rows, show_user=True)
     else:
         # engagement-wide listing (for lateral-movement planning / reporting)
-        q = "SELECT * FROM accesses"
-        if getattr(args, "valid", False):
-            q += " WHERE status='valid'"
+        admin = getattr(args, "admin", False)
+        valid = getattr(args, "valid", False)
+        q, params, conds = "SELECT * FROM accesses", [], []
+        if admin:
+            conds.append("status='valid'")   # "where I HAVE admin" = confirmed
+            conds.append("privilege IN (%s)" % ",".join("?" * len(ELEVATED_PRIVS)))
+            params.extend(ELEVATED_PRIVS)
+        elif valid:
+            conds.append("status='valid'")
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY status, scope"
-        rows = store.conn.execute(q).fetchall()
-        print(store.c.bold("valid accesses:" if getattr(args, "valid", False) else "all accesses:"))
+        rows = store.conn.execute(q, params).fetchall()
+        print(store.c.bold("admin accesses (local_admin/domain_admin/root):" if admin
+                           else "valid accesses:" if valid else "all accesses:"))
         _print_accesses(store, rows, show_user=True)
 
 
@@ -2304,6 +2376,10 @@ def build_parser():
     i.set_defaults(func=cmd_import_secretsdump)
     i = isub.add_parser("nxc", help="NetExec/CrackMapExec console output")
     i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_nxc)
+    i = isub.add_parser("kerberoast", help="impacket GetUserSPNs $krb5tgs$ hashes")
+    i.add_argument("--domain"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_kerberoast)
+    i = isub.add_parser("asrep", aliases=["asreproast"], help="impacket GetNPUsers $krb5asrep$ hashes")
+    i.add_argument("--domain"); i.add_argument("file", nargs="?"); i.set_defaults(func=cmd_import_asrep)
 
     # queries
     sp = sub.add_parser("users", help="list identities")
@@ -2322,6 +2398,9 @@ def build_parser():
     sp.add_argument("--user"); sp.add_argument("--null", action="store_true"); sp.add_argument("--realm")
     sp.add_argument("--host")
     sp.add_argument("--valid", action="store_true", help="with no --user/--host: only valid accesses")
+    sp.add_argument("--admin", action="store_true",
+                    help="with no --user/--host: only elevated accesses "
+                         "(local_admin/domain_admin/root) - where you have admin; implies valid")
     sp.set_defaults(func=cmd_where)
 
     sp = sub.add_parser("show", help="show a user or secret in detail")
