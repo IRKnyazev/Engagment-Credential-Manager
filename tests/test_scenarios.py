@@ -729,6 +729,53 @@ def invariant_nxc_sam_unify_by_alias(cx):
     assert cx.q1("SELECT COUNT(*) FROM hosts WHERE name='unifybox'") == 0, "the hostname host folded into the ip host"
 
 
+def invariant_import_roast(cx):
+    # unique account names so this is independent of the shared db's other rows
+    ktgs = r'$krb5tgs$23$*tgsvc$CORP.LOCAL$MSSQLSvc/sql01.corp.local:1433*$1122$aabb'
+    kasrep = r'$krb5asrep$23$asrepper@CORP.LOCAL:3344$ccdd'
+    kp = os.path.join(cx.workdir, "roast_tgs.hashes"); open(kp, "w").write(ktgs + "\n")
+    ap = os.path.join(cx.workdir, "roast_asrep.hashes"); open(ap, "w").write(kasrep + "\n")
+    cx.run("import", "kerberoast", "--domain", "corp.local", kp)
+    cx.run("import", "asrep", "--domain", "corp.local", ap)
+    # each hash stored verbatim (so a potfile matches) on the right domain account
+    assert cx.q1("SELECT COUNT(*) FROM secrets WHERE type='kerberos_tgs' AND value=?", (ktgs,)) == 1
+    assert cx.q1("SELECT COUNT(*) FROM secrets WHERE type='kerberos_asrep' AND value=?", (kasrep,)) == 1
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='tgsvc' AND realm_type='domain'") == 1
+    assert cx.q1("SELECT COUNT(*) FROM identities WHERE username='asrepper' AND realm_type='domain'") == 1
+    # re-import is a no-op (unique by type+value)
+    cx.run("import", "kerberoast", "--domain", "corp.local", kp)
+    assert cx.q1("SELECT COUNT(*) FROM secrets WHERE type='kerberos_tgs' AND value=?", (ktgs,)) == 1
+    # crack the potfile -> plaintext propagates onto the roasted accounts
+    pot = os.path.join(cx.workdir, "roast.pot")
+    open(pot, "w").write("%s:SqlP@ss1\n%s:Asrep123\n" % (ktgs, kasrep))
+    cx.run("cracked", "--from", pot)
+    assert "SqlP@ss1" in cx.run("show", "user", "corp.local\\tgsvc")
+    assert "Asrep123" in cx.run("show", "user", "corp.local\\asrepper")
+
+
+def invariant_roast_realm_from_hash(cx):
+    # with no --domain the realm is taken from the hash (here CORP.COM)
+    h = r'$krb5asrep$23$nodom@CORP.COM:5566$eeff'
+    p = os.path.join(cx.workdir, "nodom.hashes"); open(p, "w").write(h + "\n")
+    cx.run("import", "asrep", p)
+    assert cx.q1("SELECT COUNT(*) FROM identities i JOIN domains d ON d.id=i.realm_id "
+                 "WHERE i.username='nodom' AND i.realm_type='domain' AND d.fqdn='CORP.COM'") == 1
+
+
+def invariant_where_admin(cx):
+    # cm works needs the identity to carry a secret (it means "this cred logged in")
+    for u in ("wa_la", "wa_da", "wa_plain", "wa_bad"):
+        cx.run("cred", "corp.local\\%s" % u, "--nt", "00112233445566778899aabbccddeeff")
+    cx.run("works", "corp.local\\wa_la", "--at", "10.9.9.10", "--proto", "smb", "--priv", "local_admin")
+    cx.run("works", "corp.local\\wa_da", "--at", "10.9.9.11", "--proto", "smb", "--priv", "domain_admin")
+    cx.run("works", "corp.local\\wa_plain", "--at", "10.9.9.12", "--proto", "smb", "--priv", "user")
+    cx.run("fail",  "corp.local\\wa_bad", "--at", "10.9.9.13")
+    out = cx.run("where", "--admin")
+    assert "10.9.9.10" in out and "10.9.9.11" in out, "admin view must include elevated accesses"
+    assert "10.9.9.12" not in out, "admin view must exclude a plain-user access"
+    assert "10.9.9.13" not in out, "admin view must exclude an invalid access"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="cm_test_")
     db = os.path.join(tmp, "corp.db")
@@ -774,6 +821,9 @@ def main():
         ("INV host alias unifies references by name and ip", invariant_host_alias_unifies),
         ("INV host alias absorbs a pre-existing duplicate host", invariant_host_alias_absorb),
         ("INV nxc+SAM converge on one host via the hostname alias", invariant_nxc_sam_unify_by_alias),
+        ("INV import kerberoast/asrep -> potfile crack propagates", invariant_import_roast),
+        ("INV roast realm taken from the hash when --domain omitted", invariant_roast_realm_from_hash),
+        ("INV where --admin shows only elevated valid accesses", invariant_where_admin),
     ]
     print("running %d scenario checks against %s\n" % (len(scenarios), db))
     for name, fn in scenarios:
